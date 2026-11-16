@@ -501,7 +501,7 @@ class MultiprocExecutor(Executor):
                 p.kill()
 
     def shutdown(self):
-        """Properly shut down the executor and its workers"""
+        """Properly shut down the executor and its workers."""
         if not getattr(self, "shutting_down", False):
             worker_count = len(getattr(self, "workers", None) or [])
             logger.debug(
@@ -854,7 +854,6 @@ class WorkerProc:
     def worker_main(*args, **kwargs):
         """Worker initialization and execution loops.
         This runs a background process"""
-
         # Signal handler used for graceful termination.
         # SystemExit exception is only raised once to allow this and worker
         # processes to terminate without error
@@ -1069,7 +1068,6 @@ class WorkerProc:
 
     def async_output_busy_loop(self):
         """Entrypoint for the thread which handles outputs asynchronously."""
-
         # set device to the worker device for the thread.
         # a thread will not inherit the context of the main thread.
         # when calling any cuda runtime functions, it will implicitly
@@ -1086,7 +1084,7 @@ class WorkerProc:
             self.enqueue_output(output)
 
     def worker_busy_loop(self):
-        """Main busy loop for Multiprocessing Workers"""
+        """Main busy loop for Multiprocessing Workers."""
         assert self.rpc_broadcast_mq is not None
         while True:
             self._execute_worker_rpc(self.rpc_broadcast_mq.dequeue(indefinite=True))
@@ -1158,7 +1156,6 @@ def set_multiprocessing_worker_envs(local_world_size: int = 1):
     """Set up environment variables that should be used when there are workers
     in a multiprocessing environment. This should be called by the parent
     process before worker processes are created"""
-
     _maybe_force_spawn()
 
     if current_platform.is_cpu() or "OMP_NUM_THREADS" in os.environ:
