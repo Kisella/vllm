@@ -266,9 +266,7 @@ class LwdEdgeProbeManager:
             if not future.done():
                 future.cancel()
 
-        timer = threading.Timer(
-            coordination.probe_timeout + PROBE_HEADROOM_S, watchdog
-        )
+        timer = threading.Timer(coordination.probe_timeout + PROBE_HEADROOM_S, watchdog)
         timer.daemon = True
 
         def done(future: Any) -> None:
