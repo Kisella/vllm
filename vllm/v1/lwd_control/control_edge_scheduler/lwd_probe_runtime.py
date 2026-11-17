@@ -52,15 +52,24 @@ class LwdProbeRuntime:
             )
         return self._session
 
+    async def _bounded(self, coroutine: Coroutine[Any, Any, Any]) -> Any:
+        assert self._inflight is not None
+        async with self._inflight:
+            return await coroutine
+
     def submit(self, coroutine: Coroutine[Any, Any, Any]) -> Future[Any]:
         """Submit one probe, bounding queued and executing HTTP work."""
+        return asyncio.run_coroutine_threadsafe(self._bounded(coroutine), self._loop)
 
-        async def bounded() -> Any:
-            assert self._inflight is not None
-            async with self._inflight:
-                return await coroutine
+    def submit_group(self, coroutines: list[Coroutine[Any, Any, Any]]) -> Future[Any]:
+        """Run a request batch with one inflight permit per candidate DP."""
 
-        return asyncio.run_coroutine_threadsafe(bounded(), self._loop)
+        async def group() -> list[Any]:
+            return await asyncio.gather(
+                *(self._bounded(coroutine) for coroutine in coroutines)
+            )
+
+        return asyncio.run_coroutine_threadsafe(group(), self._loop)
 
     def stop(self) -> None:
         """Close the HTTP session and stop the loop without blocking the engine."""
