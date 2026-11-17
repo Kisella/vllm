@@ -330,6 +330,3 @@ class LwdProbeQueryAdapter:
 
     def peek(self, manifest: LwdPrefixManifest) -> LwdProbeResult:
         return self._query(manifest)
-
-    def probe(self, manifest: LwdPrefixManifest) -> LwdProbeResult:
-        return self._query(manifest)

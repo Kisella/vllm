@@ -376,14 +376,6 @@ class LwdCloudScheduler(LwdBaseScheduler):
             request_ids = (request_ids,)
         else:
             request_ids = tuple(request_ids)
-        for request_id in request_ids:
-            request = self.requests.get(request_id)
-            if request is not None:
-                self.lwd_finished_records[request_id] = (
-                    request.num_prompt_tokens,
-                    request.num_output_tokens,
-                    getattr(request, "lwd_prefix_nonce", 0),
-                )
         if finished_status == RequestStatus.FINISHED_ABORTED:
             for request_id in request_ids:
                 self._lwd_drop_request(request_id)

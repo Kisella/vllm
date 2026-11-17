@@ -328,7 +328,7 @@ def test_abort_records_drop_and_preserves_native_iterable(
     assert scheduler._lwd_dropped == {"p"}
     assert scheduler._lwd_abort_pending == ["p"]
     assert received == [(("p",), RequestStatus.FINISHED_ABORTED)]
-    assert scheduler.lwd_finished_records["p"] == (10, 0, 7)
+    assert scheduler.lwd_finished_records == {}
 
 
 def test_abort_only_embed_and_non_embed_retry_do_not_lose_notice() -> None:

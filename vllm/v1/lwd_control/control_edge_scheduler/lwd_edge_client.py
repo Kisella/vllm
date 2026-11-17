@@ -13,7 +13,10 @@ from typing import Any
 
 from vllm import envs
 from vllm.logger import init_logger
-from vllm.v1.lwd_control.lwd_comm.lwd_mm_identity import mm_abi_header_value
+from vllm.v1.lwd_control.lwd_comm.lwd_mm_identity import (
+    mm_abi_header_value,
+    negotiate_lwd_protocol,
+)
 from vllm.v1.lwd_control.lwd_comm.lwd_prefix import (
     HEADER_CLOUD_ID,
     HEADER_EDGE_ID,
@@ -263,16 +266,23 @@ class LwdEdgePrefixClient:
         multimodal: bool,
     ) -> LwdProbeResult:
         expected_protocol = PROTOCOL_VERSION_MM if multimodal else PROTOCOL_VERSION
-        if (
-            not isinstance(message, dict)
-            or message.get("protocol") != expected_protocol
-        ):
-            raise RuntimeError(f"cloud did not acknowledge {expected_protocol}")
-        mm_abi = message.get("mm_abi")
-        if multimodal and mm_abi != self._mm_abi_header:
-            raise RuntimeError("cloud MM-ABI fingerprint does not match")
-        if not multimodal and mm_abi is not None:
-            raise RuntimeError("cloud returned MM-ABI for a text-only probe")
+        protocol = message.get("protocol") if isinstance(message, dict) else None
+        mm_abi = message.get("mm_abi") if isinstance(message, dict) else None
+        try:
+            negotiate_lwd_protocol(
+                protocol,
+                mm_abi,
+                expected_protocol=expected_protocol,
+                expected_mm_abi=self._mm_abi_header,
+            )
+        except ValueError as exc:
+            if protocol != expected_protocol:
+                raise RuntimeError(
+                    f"cloud did not acknowledge {expected_protocol}"
+                ) from exc
+            if multimodal:
+                raise RuntimeError("cloud MM-ABI fingerprint does not match") from exc
+            raise RuntimeError("cloud returned MM-ABI for a text-only probe") from exc
         probe = LwdProbeResult.from_control_message(message)
         if probe.request_id != request_id:
             raise RuntimeError("cloud returned a different request ID")

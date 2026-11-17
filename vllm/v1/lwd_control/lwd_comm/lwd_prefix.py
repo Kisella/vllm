@@ -25,6 +25,7 @@ import pybase64 as base64
 
 PROTOCOL_VERSION = "edge-cloud-prefix-v1"
 PROTOCOL_VERSION_MM = "edge-cloud-prefix-v2"
+PROBE_HEADROOM_S = 5.0
 BLOCK_HASH_PREFIX = "ecb1:"
 TAIL_HASH_PREFIX = "ec" + "t1:"
 DIGEST_SIZE = hashlib.sha256().digest_size
@@ -42,6 +43,17 @@ HEADER_CLOUD_ID = "X-Edge-Cloud-Cloud-Id"
 HEADER_PROMPT_TOKENS = "X-Edge-Cloud-Prompt-Tokens"
 HEADER_ENGINE_INDEX = "X-Edge-Cloud-Engine-Index"
 HEADER_PROBE_NONCE = "X-Lwd-Probe-Nonce"
+
+_PROBE_RESULT_HEADERS = {
+    "request_id": HEADER_REQUEST_ID,
+    "instance_id": HEADER_INSTANCE_ID,
+    "block_size": HEADER_BLOCK_SIZE,
+    "hit_blocks": HEADER_HIT_BLOCKS,
+    "hit_tokens": HEADER_HIT_TOKENS,
+    "alignment_tokens": HEADER_ALIGNMENT_TOKENS,
+    "cloud_id": HEADER_CLOUD_ID,
+    "engine_index": HEADER_ENGINE_INDEX,
+}
 
 _FULL_BLOCK_DOMAIN = b"\x01"
 _TAIL_BLOCK_DOMAIN = b"\x02"
@@ -443,20 +455,25 @@ class LwdProbeResult:
         if self.engine_index < 0:
             raise ValueError("engine_index must not be negative")
 
-    def to_headers(self) -> dict[str, str]:
-        headers = {
-            HEADER_PROTOCOL: PROTOCOL_VERSION,
-            HEADER_REQUEST_ID: self.request_id,
-            HEADER_INSTANCE_ID: self.instance_id,
-            HEADER_BLOCK_SIZE: str(self.block_size),
-            HEADER_HIT_BLOCKS: str(self.hit_blocks),
-            HEADER_HIT_TOKENS: str(self.hit_tokens),
-            HEADER_ALIGNMENT_TOKENS: str(self.alignment_tokens),
-            HEADER_ENGINE_INDEX: str(self.engine_index),
+    def _wire_fields(self) -> dict[str, Any]:
+        fields: dict[str, Any] = {
+            "request_id": self.request_id,
+            "instance_id": self.instance_id,
+            "block_size": self.block_size,
+            "hit_blocks": self.hit_blocks,
+            "hit_tokens": self.hit_tokens,
+            "alignment_tokens": self.alignment_tokens,
+            "engine_index": self.engine_index,
         }
         if self.cloud_id is not None:
-            headers[HEADER_CLOUD_ID] = str(self.cloud_id)
-        return headers
+            fields["cloud_id"] = self.cloud_id
+        return fields
+
+    def to_headers(self) -> dict[str, str]:
+        return {HEADER_PROTOCOL: PROTOCOL_VERSION} | {
+            _PROBE_RESULT_HEADERS[name]: str(value)
+            for name, value in self._wire_fields().items()
+        }
 
     def to_control_message(
         self, protocol: str = PROTOCOL_VERSION, mm_abi: str | None = None
@@ -469,16 +486,8 @@ class LwdProbeResult:
         message: dict[str, Any] = {
             "type": "edge_cloud_probe",
             "protocol": protocol,
-            "request_id": self.request_id,
-            "instance_id": self.instance_id,
-            "block_size": self.block_size,
-            "hit_blocks": self.hit_blocks,
-            "hit_tokens": self.hit_tokens,
-            "alignment_tokens": self.alignment_tokens,
-            "engine_index": self.engine_index,
+            **self._wire_fields(),
         }
-        if self.cloud_id is not None:
-            message["cloud_id"] = self.cloud_id
         if mm_abi is not None:
             message["mm_abi"] = mm_abi
         return message
