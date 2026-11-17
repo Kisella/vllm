@@ -32,7 +32,7 @@ from vllm.v1.lwd_control.lwd_comm.lwd_id_adapter import wrap_req_id
 from vllm.v1.lwd_control.lwd_comm.lwd_mm_identity import (
     compute_processor_fingerprint,
     mm_abi_header_value,
-    validate_mm_abi_header,
+    negotiate_lwd_protocol,
 )
 from vllm.v1.lwd_control.lwd_comm.lwd_prefix import (
     HEADER_CLOUD_ID,
@@ -44,6 +44,7 @@ from vllm.v1.lwd_control.lwd_comm.lwd_prefix import (
     HEADER_REQUEST_ID,
     PROTOCOL_VERSION,
     PROTOCOL_VERSION_MM,
+    PROBE_HEADROOM_S,
     LwdPrefixManifest,
     LwdProbeResult,
     LwdUsage,
@@ -53,7 +54,6 @@ logger = init_logger(__name__)
 
 _USAGE_HEARTBEAT_INTERVAL = 10.0
 _USAGE_ADMISSION_TIMEOUT_S = 600.0
-_CLOUD_PROBE_HEADROOM_S = 5.0
 _CLOUD_PROBE_POLL_BUDGET = 32
 _SERVER_START_TIMEOUT = 30.0
 _SERVER_STOP_TIMEOUT = 5.0
@@ -149,7 +149,6 @@ class LwdCloudControlBridge:
             {
                 "type": "probe",
                 "manifest": manifest,
-                "reserve": False,
                 "engine_index": dp_idx,
                 "reply_key": reply_key,
                 "t_cmd": now,
@@ -391,21 +390,12 @@ def _negotiate_lwd_protocol_headers(
     enforce_mm_abi_match: bool,
 ) -> str | None:
     normalized = {k.lower(): v for k, v in headers.items()}
-    protocol = normalized.get(HEADER_PROTOCOL.lower())
-    mm_abi = normalized.get(HEADER_MM_ABI.lower())
-    if protocol == PROTOCOL_VERSION_MM:
-        value = validate_mm_abi_header(mm_abi)
-        if expected_mm_abi is None:
-            raise ValueError(
-                f"{PROTOCOL_VERSION_MM} requires a locally computed "
-                f"{HEADER_MM_ABI} fingerprint on the cloud"
-            )
-        if enforce_mm_abi_match and value != expected_mm_abi:
-            raise ValueError(f"{HEADER_MM_ABI} fingerprint does not match this cloud")
-        return expected_mm_abi
-    if mm_abi is not None:
-        raise ValueError(f"{HEADER_MM_ABI} requires protocol {PROTOCOL_VERSION_MM}")
-    return None
+    return negotiate_lwd_protocol(
+        normalized.get(HEADER_PROTOCOL.lower()),
+        normalized.get(HEADER_MM_ABI.lower()),
+        expected_mm_abi=expected_mm_abi,
+        enforce_mm_abi_match=enforce_mm_abi_match,
+    )
 
 
 def _sse_data(obj: Any) -> str:
@@ -638,7 +628,7 @@ def start_lwd_cloud_control_server(
     event_queue = mp_ctx.Queue()
     bridge = LwdCloudControlBridge(command_queues, event_queue)
     bridge.start()
-    cloud_probe_timeout = max(coord_cfg.probe_timeout - _CLOUD_PROBE_HEADROOM_S, 1.0)
+    cloud_probe_timeout = max(coord_cfg.probe_timeout - PROBE_HEADROOM_S, 1.0)
     fingerprint = compute_processor_fingerprint(vllm_config.model_config)
     servers = []
     for dp in cloud_dps:

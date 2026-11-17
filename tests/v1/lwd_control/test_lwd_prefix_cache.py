@@ -21,9 +21,25 @@ from vllm.v1.lwd_control.control_cloud_scheduler.lwd_prefix_cache import (
 from vllm.v1.lwd_control.control_scheduler.lwd_base_scheduler import (
     LwdBaseScheduler,
 )
+from vllm.v1.lwd_control.lwd_comm.lwd_mm_identity import (
+    mm_abi_header_value,
+    negotiate_lwd_protocol,
+)
 from vllm.v1.lwd_control.lwd_comm.lwd_prefix import (
     DIGEST_SIZE,
+    HEADER_ALIGNMENT_TOKENS,
+    HEADER_BLOCK_SIZE,
+    HEADER_CLOUD_ID,
+    HEADER_ENGINE_INDEX,
+    HEADER_HIT_BLOCKS,
+    HEADER_HIT_TOKENS,
+    HEADER_INSTANCE_ID,
+    HEADER_PROTOCOL,
+    HEADER_REQUEST_ID,
+    PROTOCOL_VERSION,
+    PROTOCOL_VERSION_MM,
     LwdPrefixManifest,
+    LwdProbeResult,
 )
 
 
@@ -217,7 +233,7 @@ def test_probe_query_without_prefix_caching_skips_block_size_contract() -> None:
         prefix_caching=False,
     )
 
-    result = adapter.probe(_manifest(block_size=16))
+    result = adapter.peek(_manifest(block_size=16))
 
     assert (result.block_size, result.hit_blocks, result.hit_tokens) == (16, 0, 0)
     assert result.cloud_id == 0
@@ -234,7 +250,7 @@ def test_probe_query_with_prefix_caching_enforces_block_size() -> None:
     )
 
     with pytest.raises(ValueError, match="must match the cloud hash block size"):
-        adapter.probe(_manifest(block_size=16))
+        adapter.peek(_manifest(block_size=16))
 
 
 def test_probe_query_with_prefix_caching_reports_cloud_hit() -> None:
@@ -247,7 +263,7 @@ def test_probe_query_with_prefix_caching_reports_cloud_hit() -> None:
         cloud_id=1,
     )
 
-    result = adapter.probe(_manifest(block_size=16))
+    result = adapter.peek(_manifest(block_size=16))
 
     assert (result.block_size, result.hit_tokens, result.cloud_id) == (16, 32, 1)
 
@@ -376,3 +392,81 @@ def test_cloud_scheduler_keeps_sparse_retention_config(
     LwdCloudScheduler(vllm_config, kv_cache_config)
 
     assert kv_cache_config.prefix_cache_retention_interval == 0
+
+
+def test_probe_result_wire_shapes_share_the_same_fields() -> None:
+    result = LwdProbeResult(
+        request_id="r",
+        instance_id="cloud-0",
+        block_size=16,
+        hit_blocks=2,
+        hit_tokens=32,
+        alignment_tokens=128,
+        cloud_id=1,
+        engine_index=2,
+    )
+
+    assert result.to_headers() == {
+        HEADER_PROTOCOL: PROTOCOL_VERSION,
+        HEADER_REQUEST_ID: "r",
+        HEADER_INSTANCE_ID: "cloud-0",
+        HEADER_BLOCK_SIZE: "16",
+        HEADER_HIT_BLOCKS: "2",
+        HEADER_HIT_TOKENS: "32",
+        HEADER_ALIGNMENT_TOKENS: "128",
+        HEADER_CLOUD_ID: "1",
+        HEADER_ENGINE_INDEX: "2",
+    }
+    message = result.to_control_message()
+    assert message == {
+        "type": "edge_cloud_probe",
+        "protocol": PROTOCOL_VERSION,
+        "request_id": "r",
+        "instance_id": "cloud-0",
+        "block_size": 16,
+        "hit_blocks": 2,
+        "hit_tokens": 32,
+        "alignment_tokens": 128,
+        "cloud_id": 1,
+        "engine_index": 2,
+    }
+    assert LwdProbeResult.from_headers(result.to_headers()) == result
+    assert LwdProbeResult.from_control_message(message) == result
+
+
+def test_protocol_mm_abi_validation_matrix() -> None:
+    local_abi = mm_abi_header_value(bytes(range(DIGEST_SIZE)))
+    peer_abi = mm_abi_header_value(bytes(reversed(range(DIGEST_SIZE))))
+
+    assert negotiate_lwd_protocol(PROTOCOL_VERSION, None) is None
+    with pytest.raises(ValueError, match="requires protocol"):
+        negotiate_lwd_protocol(PROTOCOL_VERSION, local_abi)
+    with pytest.raises(ValueError, match="missing required header"):
+        negotiate_lwd_protocol(
+            PROTOCOL_VERSION_MM,
+            None,
+            expected_mm_abi=local_abi,
+            enforce_mm_abi_match=False,
+        )
+    with pytest.raises(ValueError, match="did not acknowledge"):
+        negotiate_lwd_protocol(
+            PROTOCOL_VERSION,
+            None,
+            expected_protocol=PROTOCOL_VERSION_MM,
+            expected_mm_abi=local_abi,
+        )
+    with pytest.raises(ValueError, match="does not match"):
+        negotiate_lwd_protocol(
+            PROTOCOL_VERSION_MM,
+            peer_abi,
+            expected_mm_abi=local_abi,
+        )
+    assert (
+        negotiate_lwd_protocol(
+            PROTOCOL_VERSION_MM,
+            peer_abi,
+            expected_mm_abi=local_abi,
+            enforce_mm_abi_match=False,
+        )
+        == local_abi
+    )
