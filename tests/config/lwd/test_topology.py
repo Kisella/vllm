@@ -370,12 +370,13 @@ def test_coord_url_is_derived_and_available_on_every_connection() -> None:
         assert cloud.coord_port == 8100 + cloud.dp_idx
 
 
-def test_explicit_dns_coord_url_and_ipv6_derivation() -> None:
+def test_explicit_gateway_coord_url_and_ipv6_derivation() -> None:
     raw = topology_payload("s1_single_instance_1dp.yaml")
     dp = raw["clouds"][0]["dp"][0]
-    dp["coord_url"] = "https://gateway.example.com:8100"
+    dp["coord_url"] = "https://gateway.example.com:443"
     topology = LwdTopology.from_dict(raw)
-    assert topology.clouds[0].dp[0].coord_url == "https://gateway.example.com:8100"
+    assert topology.clouds[0].dp[0].coord_url == "https://gateway.example.com:443"
+    assert topology.clouds[0].dp[0].coord_port == 8100
 
     dp["addr"] = "2001:db8::1"
     dp["ctrl_port"] = 5550
@@ -385,14 +386,28 @@ def test_explicit_dns_coord_url_and_ipv6_derivation() -> None:
     assert topology.clouds[0].dp[0].coord_url == "http://[2001:db8::1]:8100"
 
 
+def test_gateway_coord_url_can_be_shared_by_all_dps() -> None:
+    raw = topology_payload("s4_lwd_cluster_2dp.yaml")
+    for cloud in raw["clouds"]:
+        for dp in cloud["dp"]:
+            dp["coord_url"] = "https://gateway.example.com:443"
+    topology = LwdTopology.from_dict(raw)
+    assert {dp.coord_url for cloud in topology.clouds for dp in cloud.dp} == {
+        "https://gateway.example.com:443"
+    }
+    assert [dp.coord_port for cloud in topology.clouds for dp in cloud.dp] == [
+        dp["coord_port"] for cloud in raw["clouds"] for dp in cloud["dp"]
+    ]
+
+
 @pytest.mark.parametrize(
     "url,match",
     [
         ("ftp://10.1.0.1:8100", "HTTP"),
         ("http://0.0.0.0:8100", "routable"),
         ("http://bad host:8100", "whitespace"),
-        ("http://10.1.0.1:8101", "must match"),
-        ("http://10.1.0.1", "must match"),
+        ("http://10.1.0.1", "explicit port"),
+        ("http://10.1.0.1:0", "explicit port"),
     ],
 )
 def test_coord_url_rejects_invalid_endpoint(url: str, match: str) -> None:

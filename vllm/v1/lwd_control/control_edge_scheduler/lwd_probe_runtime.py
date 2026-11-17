@@ -54,12 +54,35 @@ class LwdProbeRuntime:
 
     async def _bounded(self, coroutine: Coroutine[Any, Any, Any]) -> Any:
         assert self._inflight is not None
-        async with self._inflight:
-            return await coroutine
+        entered = False
+        try:
+            async with self._inflight:
+                entered = True
+                return await coroutine
+        except BaseException:
+            if not entered:
+                coroutine.close()
+            raise
 
-    def submit(self, coroutine: Coroutine[Any, Any, Any]) -> Future[Any]:
-        """Submit one probe, bounding queued and executing HTTP work."""
-        return asyncio.run_coroutine_threadsafe(self._bounded(coroutine), self._loop)
+    def submit(
+        self, coroutine: Coroutine[Any, Any, Any], *, timeout: float | None = None
+    ) -> Future[Any]:
+        """Submit work, optionally bounding queueing and execution together."""
+        if timeout is None:
+            return asyncio.run_coroutine_threadsafe(
+                self._bounded(coroutine), self._loop
+            )
+
+        async def bounded_with_timeout() -> Any:
+            return await asyncio.wait_for(self._bounded(coroutine), timeout)
+
+        return asyncio.run_coroutine_threadsafe(bounded_with_timeout(), self._loop)
+
+    def cancel_task(self, task: asyncio.Task[Any]) -> None:
+        try:
+            self._loop.call_soon_threadsafe(task.cancel)
+        except RuntimeError:
+            pass
 
     def submit_group(self, coroutines: list[Coroutine[Any, Any, Any]]) -> Future[Any]:
         """Run a request batch with one inflight permit per candidate DP."""

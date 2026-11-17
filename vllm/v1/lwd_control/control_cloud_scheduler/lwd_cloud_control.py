@@ -20,7 +20,7 @@ import socket
 import threading
 import time
 from collections.abc import AsyncIterator, Mapping
-from dataclasses import replace as dataclass_replace
+from dataclasses import dataclass, field, replace as dataclass_replace
 from typing import Any
 
 from fastapi import FastAPI, Request
@@ -51,10 +51,19 @@ from vllm.v1.lwd_control.lwd_comm.lwd_prefix import (
 logger = init_logger(__name__)
 
 _USAGE_HEARTBEAT_INTERVAL = 10.0
-_USAGE_WAIT_TIMEOUT = 600.0
+_USAGE_ADMISSION_TIMEOUT_S = 600.0
 _CLOUD_PROBE_HEADROOM_S = 5.0
+_CLOUD_PROBE_POLL_BUDGET = 32
 _SERVER_START_TIMEOUT = 30.0
 _SERVER_STOP_TIMEOUT = 5.0
+
+
+@dataclass
+class _LwdUsageRegistration:
+    engine_index: int
+    prefix_nonce: int
+    future: asyncio.Future[LwdUsage | None]
+    started: asyncio.Event = field(default_factory=asyncio.Event)
 
 
 class LwdCloudControlBridge:
@@ -69,7 +78,7 @@ class LwdCloudControlBridge:
             raise ValueError("cloud control requires at least one command queue")
         self._event_queue = event_queue
         self._probe_futures: dict[str, tuple[int, asyncio.Future[LwdProbeResult]]] = {}
-        self._usage_futures: dict[str, asyncio.Future[LwdUsage | None]] = {}
+        self._usage_futures: dict[str, _LwdUsageRegistration] = {}
         self._loop: asyncio.AbstractEventLoop | None = None
         self._lock = threading.Lock()
         self._closed = False
@@ -84,9 +93,9 @@ class LwdCloudControlBridge:
         """Stop dispatching and fail all pending futures."""
         self._closed = True
         with self._lock:
-            pending = [future for _, future in self._probe_futures.values()] + list(
-                self._usage_futures.values()
-            )
+            pending = [future for _, future in self._probe_futures.values()] + [
+                registration.future for registration in self._usage_futures.values()
+            ]
             self._probe_futures.clear()
             self._usage_futures.clear()
             loop = self._loop
@@ -134,6 +143,7 @@ class LwdCloudControlBridge:
             stale[1].set_exception(
                 RuntimeError(f"probe reply key {reply_key} was superseded")
             )
+        now = time.monotonic()
         self._command_queues[dp_idx].put(
             {
                 "type": "probe",
@@ -141,7 +151,8 @@ class LwdCloudControlBridge:
                 "reserve": False,
                 "engine_index": dp_idx,
                 "reply_key": reply_key,
-                "t_cmd": time.monotonic(),
+                "t_cmd": now,
+                "deadline": now + timeout,
             }
         )
         try:
@@ -153,58 +164,76 @@ class LwdCloudControlBridge:
                     self._probe_futures.pop(reply_key, None)
             raise
 
-    def activate(self, request_id: str) -> asyncio.Future[LwdUsage | None]:
-        """Register the sole usage future before activate response headers."""
+    def activate(
+        self, request_id: str, dp_idx: int, prefix_nonce: int
+    ) -> _LwdUsageRegistration:
+        """Register one DP/nonce usage generation before response headers."""
         loop = asyncio.get_running_loop()
         with self._lock:
             if self._closed:
                 raise RuntimeError("cloud control plane stopped")
             self._loop = loop
             stale = self._usage_futures.pop(request_id, None)
-            usage_future: asyncio.Future[LwdUsage | None] = loop.create_future()
-            self._usage_futures[request_id] = usage_future
-        if stale is not None and not stale.done():
+            registration = _LwdUsageRegistration(
+                engine_index=dp_idx,
+                prefix_nonce=prefix_nonce,
+                future=loop.create_future(),
+            )
+            self._usage_futures[request_id] = registration
+        if stale is not None and not stale.future.done():
             logger.warning(
                 "[LWD][ctrl] duplicate activate req=%s: superseding usage",
                 request_id,
             )
-            stale.set_result(None)
-        return usage_future
+            stale.future.set_result(None)
+        return registration
 
-    def registration(self, request_id: str) -> asyncio.Future[LwdUsage | None] | None:
+    def registration(self, request_id: str) -> _LwdUsageRegistration | None:
         with self._lock:
             return self._usage_futures.get(request_id)
 
     async def wait_usage(
         self,
         request_id: str,
-        timeout: float = _USAGE_WAIT_TIMEOUT,
+        timeout: float = _USAGE_ADMISSION_TIMEOUT_S,
         *,
-        registration: asyncio.Future[LwdUsage | None] | None = None,
+        registration: _LwdUsageRegistration | None = None,
     ) -> LwdUsage | None:
-        """Await real terminal usage; timeout or supersede returns None."""
+        """Bound only admission; started requests wait for real terminal usage."""
         with self._lock:
-            future = self._usage_futures.get(request_id)
-        if future is None or (registration is not None and future is not registration):
-            if future is None:
+            current = self._usage_futures.get(request_id)
+        if current is None or (
+            registration is not None and current is not registration
+        ):
+            if current is None:
                 logger.warning(
                     "[LWD][ctrl] usage wait without activation req=%s", request_id
                 )
             return None
+        registration = current
+        started_wait = asyncio.create_task(registration.started.wait())
         try:
-            return await asyncio.wait_for(future, timeout)
-        except asyncio.TimeoutError:
-            logger.warning("[LWD][ctrl] usage wait timeout req=%s", request_id)
+            done, _ = await asyncio.wait(
+                {registration.future, started_wait},
+                timeout=timeout,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if registration.future in done:
+                return registration.future.result()
+            if started_wait in done:
+                return await registration.future
+            logger.warning("[LWD][ctrl] usage admission timeout req=%s", request_id)
             return None
         finally:
+            started_wait.cancel()
             with self._lock:
-                if self._usage_futures.get(request_id) is future:
+                if self._usage_futures.get(request_id) is registration:
                     self._usage_futures.pop(request_id, None)
 
     def release(
         self,
         request_id: str,
-        registration: asyncio.Future[LwdUsage | None] | None = None,
+        registration: _LwdUsageRegistration | None = None,
     ) -> None:
         """Release an activation generation, preserving a newer activation."""
         with self._lock:
@@ -265,10 +294,20 @@ class LwdCloudControlBridge:
             else:
                 future.set_exception(RuntimeError(event.get("error") or "probe failed"))
             return
-        if kind == "usage":
+        if kind in ("usage_start", "usage"):
             with self._lock:
-                future = self._usage_futures.get(request_id)
-            if future is None or future.done():
+                registration = self._usage_futures.get(request_id)
+            if (
+                registration is None
+                or registration.engine_index != event.get("engine_index")
+                or registration.prefix_nonce != event.get("prefix_nonce")
+            ):
+                return
+            if kind == "usage_start":
+                registration.started.set()
+                return
+            future = registration.future
+            if future.done():
                 logger.warning(
                     "[LWD][ctrl] usage event arrived too late req=%s", request_id
                 )
@@ -285,11 +324,11 @@ class LwdCloudControlProcessor:
 
     def poll(self, coordinator: Any) -> int:
         consumed = 0
-        while True:
+        while consumed < _CLOUD_PROBE_POLL_BUDGET:
             try:
                 command = self._pending_queue.get_nowait()
             except queue.Empty:
-                return consumed
+                break
             consumed += 1
             if command.get("type") != "probe":
                 continue
@@ -299,32 +338,43 @@ class LwdCloudControlProcessor:
             t_take = time.monotonic()
             t_cmd = command.get("t_cmd")
             cmd_wait_ms = (t_take - t_cmd) * 1000.0 if t_cmd is not None else -1.0
-            try:
-                result = coordinator.peek(manifest)
-                logger.info(
-                    "[LWD][perf][cloud] probe_consumed req=%s "
-                    "cmd_wait_ms=%.1f probe_ms=%.1f",
-                    manifest.request_id,
-                    cmd_wait_ms,
-                    (time.monotonic() - t_take) * 1000.0,
-                )
-                event = {
-                    "type": "probe",
-                    "request_id": reply_key,
-                    "engine_index": engine_index,
-                    "ok": True,
-                    "result": result,
-                }
-            except Exception as exc:  # noqa: BLE001
-                logger.exception("[LWD][ctrl] probe failed")
+            deadline = command.get("deadline")
+            if deadline is not None and t_take >= deadline:
                 event = {
                     "type": "probe",
                     "request_id": reply_key,
                     "engine_index": engine_index,
                     "ok": False,
-                    "error": str(exc),
+                    "error": "probe command expired",
                 }
+            else:
+                try:
+                    result = coordinator.peek(manifest)
+                    logger.info(
+                        "[LWD][perf][cloud] probe_consumed req=%s "
+                        "cmd_wait_ms=%.1f probe_ms=%.1f",
+                        manifest.request_id,
+                        cmd_wait_ms,
+                        (time.monotonic() - t_take) * 1000.0,
+                    )
+                    event = {
+                        "type": "probe",
+                        "request_id": reply_key,
+                        "engine_index": engine_index,
+                        "ok": True,
+                        "result": result,
+                    }
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception("[LWD][ctrl] probe failed")
+                    event = {
+                        "type": "probe",
+                        "request_id": reply_key,
+                        "engine_index": engine_index,
+                        "ok": False,
+                        "error": str(exc),
+                    }
             self._event_queue.put(event)
+        return consumed
 
 
 def _negotiate_lwd_protocol_headers(
@@ -472,8 +522,8 @@ def create_lwd_cloud_control_app(
     @app.post("/v1/lwd/activate")
     async def activate(request: Request) -> Any:
         try:
-            manifest, body, display_id, mm_abi, _ = await parse_request(request)
-            registration = bridge.activate(manifest.request_id)
+            manifest, body, display_id, mm_abi, nonce = await parse_request(request)
+            registration = bridge.activate(manifest.request_id, dp_idx, nonce)
         except ValueError as exc:
             return JSONResponse({"error": f"bad request: {exc}"}, status_code=400)
         except Exception as exc:  # noqa: BLE001

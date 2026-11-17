@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import queue
+import time
 from collections.abc import AsyncIterator, Callable
 from types import SimpleNamespace
 from typing import Any
@@ -80,6 +81,23 @@ def _result(request_id: str, hit_blocks: int, engine_index: int = 0) -> LwdProbe
     )
 
 
+def _usage_event(
+    request_id: str,
+    usage: LwdUsage,
+    *,
+    engine_index: int = 0,
+    prefix_nonce: int = 7,
+    kind: str = "usage",
+) -> dict[str, Any]:
+    return {
+        "type": kind,
+        "request_id": request_id,
+        "usage": usage,
+        "engine_index": engine_index,
+        "prefix_nonce": prefix_nonce,
+    }
+
+
 async def _start_probe(
     bridge: LwdCloudControlBridge,
     command_queue: queue.Queue[Any],
@@ -98,6 +116,7 @@ async def _start_probe(
     assert command["reserve"] is False
     assert command["engine_index"] == dp_idx
     assert command["reply_key"] == key
+    assert command["deadline"] == command["t_cmd"] + timeout
     return task, command
 
 
@@ -163,8 +182,8 @@ async def test_activate_owns_usage_and_old_release_preserves_new_generation(
     bridge_factory: BridgeFactory,
 ) -> None:
     bridge, _, event_queue = bridge_factory(1)
-    old_registration = bridge.activate("usage")
-    new_registration = bridge.activate("usage")
+    old_registration = bridge.activate("usage", 0, 7)
+    new_registration = bridge.activate("usage", 1, 8)
     assert (
         await bridge.wait_usage("usage", timeout=1, registration=old_registration)
         is None
@@ -173,7 +192,12 @@ async def test_activate_owns_usage_and_old_release_preserves_new_generation(
     assert bridge.registration("usage") is new_registration
 
     expected = LwdUsage(prompt_tokens=16, completion_tokens=4, cached_tokens=8)
-    event_queue.put({"type": "usage", "request_id": "usage", "usage": expected})
+    event_queue.put(
+        _usage_event(
+            "usage", expected, engine_index=1, prefix_nonce=8, kind="usage_start"
+        )
+    )
+    event_queue.put(_usage_event("usage", expected, engine_index=1, prefix_nonce=8))
     assert (
         await bridge.wait_usage("usage", timeout=1, registration=new_registration)
         is expected
@@ -182,11 +206,82 @@ async def test_activate_owns_usage_and_old_release_preserves_new_generation(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("old_dp", "old_nonce"), [(0, 8), (1, 7)])
+async def test_usage_rejects_mismatched_generation(
+    bridge_factory: BridgeFactory, old_dp: int, old_nonce: int
+) -> None:
+    bridge, _, event_queue = bridge_factory(1)
+    registration = bridge.activate("generation", 1, 8)
+    old_usage = LwdUsage(prompt_tokens=10, completion_tokens=1, cached_tokens=0)
+    expected = LwdUsage(prompt_tokens=16, completion_tokens=4, cached_tokens=8)
+    waiter = asyncio.create_task(
+        bridge.wait_usage("generation", timeout=1, registration=registration)
+    )
+    event_queue.put(
+        _usage_event(
+            "generation",
+            old_usage,
+            engine_index=old_dp,
+            prefix_nonce=old_nonce,
+            kind="usage_start",
+        )
+    )
+    event_queue.put(
+        _usage_event(
+            "generation", old_usage, engine_index=old_dp, prefix_nonce=old_nonce
+        )
+    )
+    await asyncio.sleep(0.05)
+    assert not waiter.done()
+
+    event_queue.put(
+        _usage_event(
+            "generation", expected, engine_index=1, prefix_nonce=8, kind="usage_start"
+        )
+    )
+    event_queue.put(
+        _usage_event("generation", expected, engine_index=1, prefix_nonce=8)
+    )
+    assert await waiter is expected
+
+
+@pytest.mark.asyncio
+async def test_usage_admission_timeout_releases_registration(
+    bridge_factory: BridgeFactory,
+) -> None:
+    bridge, _, _ = bridge_factory(1)
+    registration = bridge.activate("admission", 0, 7)
+    assert (
+        await bridge.wait_usage("admission", timeout=0.01, registration=registration)
+        is None
+    )
+    assert bridge.registration("admission") is None
+
+
+@pytest.mark.asyncio
+async def test_started_usage_wait_has_no_total_timeout(
+    bridge_factory: BridgeFactory,
+) -> None:
+    bridge, _, event_queue = bridge_factory(1)
+    registration = bridge.activate("long", 0, 7)
+    expected = LwdUsage(prompt_tokens=16, completion_tokens=4, cached_tokens=8)
+    event_queue.put(_usage_event("long", expected, kind="usage_start"))
+    await asyncio.sleep(0.02)
+    waiter = asyncio.create_task(
+        bridge.wait_usage("long", timeout=0.01, registration=registration)
+    )
+    await asyncio.sleep(0.02)
+    assert not waiter.done()
+    event_queue.put(_usage_event("long", expected))
+    assert await waiter is expected
+
+
+@pytest.mark.asyncio
 async def test_probe_cancellation_does_not_remove_activation(
     bridge_factory: BridgeFactory,
 ) -> None:
     bridge, command_queues, _ = bridge_factory(1)
-    registration = bridge.activate("cancel")
+    registration = bridge.activate("cancel", 0, 7)
     probe_task, _ = await _start_probe(
         bridge, command_queues[0], "cancel", reply_key="cancel#0"
     )
@@ -222,6 +317,58 @@ def test_processor_always_peeks_and_echoes_dp_reply_key() -> None:
     assert event["request_id"] == "r#nonce:7:0:1"
     assert event["engine_index"] == 1
     assert event["result"] is coordinator.peek.return_value
+
+
+def test_processor_skips_expired_probe_without_peek() -> None:
+    pending_queue: queue.Queue[Any] = queue.Queue()
+    event_queue: queue.Queue[Any] = queue.Queue()
+    manifest = _manifest("expired")
+    now = time.monotonic()
+    for index, deadline in enumerate((now - 1, now + 60)):
+        pending_queue.put(
+            {
+                "type": "probe",
+                "manifest": manifest,
+                "reply_key": f"expired#{index}",
+                "engine_index": 0,
+                "deadline": deadline,
+            }
+        )
+    coordinator = Mock()
+    coordinator.peek.return_value = _result("expired", 0, 0)
+
+    assert LwdCloudControlProcessor(pending_queue, event_queue).poll(coordinator) == 2
+
+    coordinator.peek.assert_called_once_with(manifest)
+    expired = event_queue.get_nowait()
+    assert not expired["ok"] and expired["error"] == "probe command expired"
+    assert event_queue.get_nowait()["ok"]
+
+
+def test_processor_poll_budget_preserves_remaining_commands() -> None:
+    pending_queue: queue.Queue[Any] = queue.Queue()
+    event_queue: queue.Queue[Any] = queue.Queue()
+    manifest = _manifest("budget")
+    for index in range(33):
+        pending_queue.put(
+            {
+                "type": "probe",
+                "manifest": manifest,
+                "reply_key": f"budget#{index}",
+                "engine_index": 0,
+                "deadline": time.monotonic() + 60,
+            }
+        )
+    coordinator = Mock()
+    coordinator.peek.return_value = _result("budget", 0, 0)
+    processor = LwdCloudControlProcessor(pending_queue, event_queue)
+
+    assert processor.poll(coordinator) == 32
+    assert pending_queue.qsize() == 1
+    assert event_queue.qsize() == 32
+    assert processor.poll(coordinator) == 1
+    assert pending_queue.empty()
+    assert event_queue.qsize() == 33
 
 
 def test_probe_result_requires_and_serializes_explicit_dp_identity() -> None:
@@ -306,15 +453,14 @@ async def test_activate_registers_before_headers_then_streams_real_usage(
     transport = httpx.ASGITransport(app=app)
     headers, body = _http_request()
     expected = LwdUsage(prompt_tokens=16, completion_tokens=3, cached_tokens=16)
-    registered: asyncio.Future[asyncio.Future[LwdUsage | None]] = (
-        asyncio.get_running_loop().create_future()
-    )
+    registered: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
 
     async def publish_usage() -> None:
         while (registration := bridge.registration("e2-r")) is None:
             await asyncio.sleep(0)
         registered.set_result(registration)
-        event_queue.put({"type": "usage", "request_id": "e2-r", "usage": expected})
+        event_queue.put(_usage_event("e2-r", expected, kind="usage_start"))
+        event_queue.put(_usage_event("e2-r", expected))
 
     publisher = asyncio.create_task(publish_usage())
     async with (

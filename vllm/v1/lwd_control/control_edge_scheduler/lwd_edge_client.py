@@ -206,7 +206,7 @@ class LwdEdgePrefixClient:
         manifest: LwdPrefixManifest | None = None,
         media_items: Sequence[Any] = (),
         model: str | None = None,
-    ) -> None:
+    ) -> asyncio.Task[None]:
         """Register usage before RequestNotify, then drain the winner stream."""
         if manifest is None:
             manifest = self.build_manifest(request_id, prompt_token_ids, media_items)
@@ -231,7 +231,7 @@ class LwdEdgePrefixClient:
                 )
             finally:
                 response.close()
-        self._start_drain(request_id, response, _iter_sse_data(response.content))
+        return self._start_drain(request_id, response, _iter_sse_data(response.content))
 
     async def _post(
         self, path: str, session: Any, headers: dict[str, str], body: dict[str, Any]
@@ -282,7 +282,7 @@ class LwdEdgePrefixClient:
 
     def _start_drain(
         self, request_id: str, response: Any, sse_data: AsyncIterator[str]
-    ) -> Any:
+    ) -> asyncio.Task[None]:
         task = asyncio.create_task(self._drain_stream(request_id, response, sse_data))
         self._drain_tasks.add(task)
         task.add_done_callback(self._drain_tasks.discard)

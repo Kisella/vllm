@@ -78,6 +78,8 @@ class _InflightProbe:
     future: Any = None
     connection_id: LwdConnectionId | None = None
     candidate: LwdProbeCandidate | None = None
+    drain_task: Any = None
+    cancelled: bool = False
 
 
 class LwdEdgeProbeManager:
@@ -300,6 +302,8 @@ class LwdEdgeProbeManager:
         inflight = self._inflight.get(request.request_id)
         if inflight is None or self._runtime is None:
             return False
+        runtime = self._runtime
+        coordination = self._vllm_config.lwd_config.coordination
         block_size = (
             candidate.result.block_size
             if candidate is not None
@@ -314,13 +318,13 @@ class LwdEdgeProbeManager:
 
         async def job() -> str | None:
             try:
-                session = await self._runtime.ensure_session()
+                session = await runtime.ensure_session()
                 manifest = client.build_manifest(
                     request.request_id,
                     list(request.prompt_token_ids),
                     media_items=inflight.media_items,
                 )
-                await client.activate(
+                drain_task = await client.activate(
                     session,
                     request.request_id,
                     list(request.prompt_token_ids),
@@ -332,11 +336,17 @@ class LwdEdgeProbeManager:
                     media_items=inflight.media_items,
                     model=self._model_name(),
                 )
+                inflight.drain_task = drain_task
+                if (
+                    inflight.cancelled
+                    or self._inflight.get(request.request_id) is not inflight
+                ):
+                    runtime.cancel_task(drain_task)
                 return None
             except Exception as exc:  # noqa: BLE001
                 return str(exc)
 
-        future = self._runtime.submit(job())
+        future = runtime.submit(job(), timeout=coordination.probe_timeout)
         inflight.future = future
 
         def done(future: Any) -> None:
@@ -350,10 +360,20 @@ class LwdEdgeProbeManager:
         future.add_done_callback(done)
         return True
 
+    def mark_admitted(self, request_id: str, nonce: int) -> None:
+        inflight = self._inflight.get(request_id)
+        if inflight is not None and inflight.nonce == nonce:
+            self._inflight.pop(request_id, None)
+
     def abort(self, request_id: str) -> None:
         inflight = self._inflight.pop(request_id, None)
-        if inflight is not None and inflight.future is not None:
+        if inflight is None:
+            return
+        inflight.cancelled = True
+        if inflight.future is not None:
             inflight.future.cancel()
+        if inflight.drain_task is not None and self._runtime is not None:
+            self._runtime.cancel_task(inflight.drain_task)
 
     def drain(self) -> list[LwdProbeCompletion]:
         completions: list[LwdProbeCompletion] = []
@@ -366,7 +386,6 @@ class LwdEdgeProbeManager:
             if inflight is None or inflight.nonce != nonce:
                 continue
             if kind == "activate":
-                del self._inflight[request_id]
                 connection_id = inflight.connection_id
                 candidate = inflight.candidate
                 completions.append(
@@ -411,10 +430,15 @@ class LwdEdgeProbeManager:
         return completions
 
     def close(self) -> None:
-        for inflight in self._inflight.values():
+        inflights = list(self._inflight.values())
+        self._inflight.clear()
+        runtime = self._runtime
+        for inflight in inflights:
+            inflight.cancelled = True
             if inflight.future is not None:
                 inflight.future.cancel()
-        if self._runtime is not None:
-            self._runtime.stop()
+            if inflight.drain_task is not None and runtime is not None:
+                runtime.cancel_task(inflight.drain_task)
+        if runtime is not None:
+            runtime.stop()
             self._runtime = None
-        self._inflight.clear()

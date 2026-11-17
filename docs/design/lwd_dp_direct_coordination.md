@@ -120,6 +120,7 @@ LwdConnectionId(edge_id, cloud_id, dp_idx)
 - **`instance_links` 改为可选。** 未配置时，对所有场景都按现有 `edges × clouds` 自动派生全互联；显式配置时完全使用配置值，不自动补链。生成或读取后的规范化连接表继续供候选展开、ZMQ、HCCL 和拓扑 digest 使用。
 - 云监听地址为 `listen_host:coord_port`；边访问地址为 `coord_url`。
 - `coord_url` 未配置时默认由 `http(s)://dp.addr:coord_port` 派生；NAT、DNS、代理或不同地址族场景显式配置 `coord_url`。
+- 有网关时，多个 DP 可以共享同一个 `coord_url`，其外部端口可以与各 DP 的 `coord_port` 不同。网关必须按 `cloud_id/dp_idx` 请求头确定性转发到对应 DP 的后端地址，不能随机或轮询选择后端。
 
 建议字段：
 
@@ -231,7 +232,7 @@ clouds:
 拓扑加载时 fail-fast：
 
 1. 云启用 coordination 时，其每个 DP 必须配置合法 `coord_port`。
-2. `coord_url` 仅允许 HTTP/HTTPS，且必须包含可路由 host 和与 `coord_port` 一致的端口；若允许显式不同外部端口，则将其作为独立网关配置校验，不能默认放行。
+2. `coord_url` 仅允许 HTTP/HTTPS，且必须包含可路由 host 和显式外部端口；外部端口可以与 `coord_port` 不同。多个 DP 共享同一 `coord_url` 时，必须确认网关能按 `cloud_id/dp_idx` 请求头确定性转发到对应 DP，配置加载不替网关校验该映射。
 3. 同一 `addr` 上，`coord_port` 不得重复，也不得与该 DP 或其他 DP 的 `ctrl_port/data_port` 冲突。
 4. 边启用 coordination 时，其每条有效 `instance_links`（显式配置或全互联派生）展开出的每个云 DP 必须具有完整 endpoint。
 5. 云 DP 数、边 DP 数和有效 `instance_links` 继续按现有场景规则校验，不放宽；缺省全互联派生不能绕过 `edge_share` 的一对一约束。
@@ -380,10 +381,10 @@ Accept: text/event-stream
 语义：
 
 1. 边侧只对赢家调用，并携带相同的请求身份和获胜 probe nonce。
-2. 云侧在返回响应头之前原子注册该 canonical request 的 usage future。
+2. 云侧在返回响应头之前原子注册该 canonical request 的 `(dp_idx, probe_nonce)` usage 代际。
 3. 边侧确认 activate 已就绪后，才通过 ZMQ 向该连接发送 `RequestNotify`。
-4. 云 EngineCore 按现有逻辑建立正式 reservation、执行请求并产生 usage。
-5. SSE 只等待该赢家的真实 usage，结束后发送 `[DONE]`；没有真实 usage 时不伪造零值。
+4. 云 EngineCore 按现有逻辑建立正式 reservation、执行请求并产生 usage；原生 prefix caching 关闭时直接执行 native ADD，nonce 仅用于 C2E/usage 代际隔离，不进入 reservation。
+5. 原生 ADD 成功后发送一次内部 `usage_start`；SSE 只等待该赢家的真实 usage，结束后发送 `[DONE]`，没有真实 usage 时不伪造零值。
 
 该顺序避免“云已产生 usage，但 HTTP 尚未注册 future”的竞态。activate 失败时不得发送 RequestNotify，可按重试策略重新选择或让请求失败，不能无 usage 保护地静默继续。
 
@@ -395,13 +396,13 @@ Accept: text/event-stream
 
 ```text
 probe key = (edge_id, request_id, probe_nonce, cloud_id, dp_idx)
-usage key = canonical_request_id(edge_id, request_id)
+usage key = (canonical_request_id(edge_id, request_id), dp_idx, probe_nonce)
 ```
 
 - probe event 必须回显完整 probe key 或等价 `reply_key + dp_idx`。
-- usage 只可能属于赢家，继续按 canonical request ID 分发。
+- usage 注册表仍以 canonical request ID 做 O(1) 索引，但 `usage_start` 和最终 usage 必须同时匹配当前 DP 与 nonce，防止同 ID 重提时旧事件完成新 future。
 - 同一 canonical request 的新 activate 可沿用明确的 supersede 规则，但只能影响赢家 usage future，不能误取消其他 DP 的候选 probe。
-- 所有迟到事件按 nonce/key 丢弃，不允许路由到新请求。
+- 所有迟到事件按 DP/nonce/key 丢弃，不允许路由到新请求；finished record 必须在请求消失前快照 nonce，覆盖正常 finish 和 abort。
 
 ### 6.5 安全与协议检查
 
@@ -452,7 +453,8 @@ listener(dp_idx)
 ### 7.3 队列和事件约束
 
 - `command_queues` 顺序继续与 cloud-local `dp_idx` 一致。
-- `event_queue` 继续共享，probe event 带 DP/probe key，usage event 带 canonical request ID。
+- `event_queue` 继续共享，probe event 带 DP/probe key，usage event 带 canonical request ID、DP 和 nonce。
+- 每个 probe 命令携带统一 deadline；云 EngineCore 每轮最多处理 32 条命令，过期命令返回失败且不再 `peek`。本轮后仍有 backlog 时必须补自身 WAKEUP，不能丢弃未过期命令或依赖恰好还有旧唤醒。
 - 不为每个 listener 创建独立 EngineCore command queue，避免 EngineCore 多消费者。
 - listener 启动失败必须使云实例启动失败；不能只启动部分 DP 后仍宣称服务 ready。
 - 所有监听完成 bind 后再发布 ready；关闭时先停止接入，再取消 pending future，最后关闭 Bridge 和队列。
@@ -466,7 +468,7 @@ cloud_probe_timeout = edge_probe_timeout - _CLOUD_PROBE_HEADROOM_S
 edge watchdog       = edge_probe_timeout + _WATCHDOG_HEADROOM_S
 ```
 
-N 个 DP 并发不能将总等待时间变成 N 倍。activate 使用独立的短连接/响应超时，usage 等待继续覆盖真实推理时长，不与 probe timeout 混用。
+N 个 DP 并发不能将总等待时间变成 N 倍。activate 的短响应预算必须同时覆盖 semaphore 排队、连接和响应头，不能只覆盖 HTTP 发出后的时间；usage SSE 不占候选 probe 并发额度。activate 到原生 ADD 成功前保留宽限期，ADD 后的 usage 等待覆盖真实推理时长，不再使用固定总超时；abort、重提、disconnect 和 close 负责取消未准入 drain 与 waiter。
 
 ## 8. 边侧运行态改造
 
@@ -479,7 +481,8 @@ N 个 DP 并发不能将总等待时间变成 N 倍。activate 使用独立的�
 - `_inflight[request_id] = _InflightProbeBatch`，批次 key 内含逻辑 `edge_id`。
 - `_done` 只携带批次汇总的候选结果表，以及后续的 activate 完成事件。
 - runtime completion 不提前携带唯一赢家；winner 由 engine thread 结合 Scheduler 账户裁定。
-- abort/close 真正取消 Future 和候选协程，而不只是删除字典项。
+- abort/close 真正取消 Future 和候选协程，而不只是删除字典项；activate 已产生 drain 后，未准入代际也必须取消 task 并关闭响应，task 发布前后都要做代际检查。
+- `RequestNotify` 成功后才释放该代际的取消所有权；之后的正常 finish/abort 继续读取真实 usage，不误关 SSE。
 
 全局 `max_inflight` 按候选 HTTP task 计数，并明确排队也受统一 deadline 限制。usage SSE 不占候选 probe 并发额度，避免长流饿死新 probe。
 
@@ -503,7 +506,7 @@ next() -> LwdCloudDpTarget | None
 ### 8.3 Engine 与 Scheduler
 
 - 将当前 `_lwd_add_request_after_probe()` 拆成“engine thread 接收候选批次并裁定目标”和“activate 完成后准入”两个阶段。
-- activate 就绪后才 `_lwd_admit_and_notify()`；等待 activate 期间 engine thread 继续处理其他事件，不阻塞等待 HTTP。
+- activate 就绪后才 `_lwd_admit_and_notify()`；等待 activate 期间 engine thread 继续处理其他事件，不阻塞等待 HTTP。`_lwd_notify_request()` 成功返回后才 `mark_admitted()`，准入或通知失败必须取消未准入 drain。
 - `_lwd_probe_chains` 只保存赢家 chain；全失败兜底不保存任何候选的命中或 chain。
 - `_lwd_route_request()`、账户结算、abort 和输出路由继续使用完整 `ConnectionId`。
 - 删除“只有 cloud_id 时选择该云任一 DP”的兼容回退。

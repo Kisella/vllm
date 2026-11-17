@@ -115,7 +115,7 @@ class LwdCloudScheduler(LwdBaseScheduler):
         self._lwd_diag = LwdControlDiag()
         self.pending_c2e: list[LwdC2eNotify] = []
         self._lwd_prefill_group_cursor = 0
-        self.lwd_finished_records: dict[str, tuple[int, int]] = {}
+        self.lwd_finished_records: dict[str, tuple[int, int, int]] = {}
         self.lwd_hash_block_size = 0
         self.lwd_prefix_hits: dict[str, int] = {}
         self.lwd_refill_sender = None
@@ -404,6 +404,7 @@ class LwdCloudScheduler(LwdBaseScheduler):
                 self.lwd_finished_records[request_id] = (
                     request.num_prompt_tokens,
                     request.num_output_tokens,
+                    getattr(request, "lwd_prefix_nonce", 0),
                 )
         if finished_status == RequestStatus.FINISHED_ABORTED:
             for request_id in request_ids:

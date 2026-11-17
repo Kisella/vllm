@@ -289,13 +289,17 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         request: Request,
         preferred: LwdConnectionId | None = None,
     ) -> None:
-        dp_idx = self.scheduler.lwd_admit_request(request, preferred)
-        client = self._lwd_coord_clients.get(dp_idx)
         try:
+            dp_idx = self.scheduler.lwd_admit_request(request, preferred)
+            client = self._lwd_coord_clients.get(dp_idx)
             if client is not None:
                 client.send_first_req()
             self._lwd_notify_request(dp_idx, request)
+            self._lwd_probe_manager.mark_admitted(
+                request.request_id, getattr(request, "lwd_prefix_nonce", 0)
+            )
         except Exception:
+            self._lwd_probe_manager.abort(request.request_id)
             self.scheduler.lwd_edge_cancel_admission(request.request_id)
             raise
 

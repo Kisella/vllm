@@ -7,6 +7,7 @@ import pytest
 
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_client import (
     LwdEdgePrefixClient,
+    _iter_sse_data,
 )
 from vllm.v1.lwd_control.lwd_comm.lwd_prefix import (
     HEADER_EDGE_ID,
@@ -124,3 +125,54 @@ def test_direct_dp_probe_rejects_misrouted_response() -> None:
             )
         )
     assert response.closed
+
+
+class _StreamingContent:
+    def __init__(self, events: list[bytes], *, block: bool = False) -> None:
+        self.events = events
+        self.block = block
+
+    def __aiter__(self):
+        async def generate():
+            for event in self.events:
+                yield event
+            if self.block:
+                await asyncio.Future()
+
+        return generate()
+
+
+def test_cancelled_usage_drain_closes_response() -> None:
+    async def run() -> None:
+        response = _Response(b"")
+        response.content = _StreamingContent([], block=True)
+        client = LwdEdgePrefixClient("http://cloud1:8101", 4, b"tenant-key-16bytes")
+        task = client._start_drain(
+            "req", response, _iter_sse_data(response.content)
+        )
+
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await asyncio.sleep(0)
+
+        assert response.closed
+        assert not client._drain_tasks
+
+    asyncio.run(run())
+
+
+def test_completed_usage_drain_closes_response() -> None:
+    async def run() -> None:
+        response = _Response(b"")
+        response.content = _StreamingContent([b"data: [DONE]\n\n"])
+        client = LwdEdgePrefixClient("http://cloud1:8101", 4, b"tenant-key-16bytes")
+        task = client._start_drain(
+            "req", response, _iter_sse_data(response.content)
+        )
+
+        await task
+
+        assert response.closed
+        assert not client._drain_tasks
+
+    asyncio.run(run())
