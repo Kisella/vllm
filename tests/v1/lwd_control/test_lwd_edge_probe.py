@@ -2,15 +2,23 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
+import threading
 import time
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
 from vllm.config.lwd.topology import LwdConnectionId
+from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_engine import (
+    LwdEdgeEngineCore,
+)
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_probe import (
     LwdEdgeProbeManager,
     LwdProbeSubmission,
+)
+from vllm.v1.lwd_control.control_edge_scheduler.lwd_probe_runtime import (
+    LwdProbeRuntime,
 )
 from vllm.v1.lwd_control.lwd_comm.lwd_prefix import LwdPrefixManifest, LwdProbeResult
 
@@ -151,8 +159,47 @@ def test_submit_fans_out_only_for_prefix_and_activates_winner(
         assert activated.connection_id == winner.connection_id
         assert activated.result == winner.result
         assert activated.probe_nonce == completion.probe_nonce
+        manager.mark_admitted("req", activated.probe_nonce)
+        assert not manager._inflight
     finally:
         manager.close()
+
+
+def test_activate_style_submit_timeout_covers_semaphore_queue() -> None:
+    runtime = LwdProbeRuntime(max_inflight=1)
+    started = threading.Event()
+    release = threading.Event()
+
+    async def hold_permit() -> None:
+        started.set()
+        while not release.is_set():
+            await asyncio.sleep(0.001)
+
+    first = runtime.submit(hold_permit())
+    assert started.wait(timeout=1)
+    try:
+        queued = runtime.submit(asyncio.sleep(0), timeout=0.01)
+        with pytest.raises(TimeoutError):
+            queued.result(timeout=1)
+    finally:
+        release.set()
+        first.result(timeout=1)
+        runtime.stop()
+
+
+def test_bounded_cancellation_closes_unstarted_coroutine() -> None:
+    async def run() -> None:
+        runtime = object.__new__(LwdProbeRuntime)
+        runtime._inflight = asyncio.Semaphore(0)
+        coroutine = Mock()
+        task = asyncio.create_task(runtime._bounded(coroutine))
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        coroutine.close.assert_called_once_with()
+
+    asyncio.run(run())
 
 
 def test_submit_failure_cleans_inflight_and_falls_back() -> None:
@@ -186,3 +233,108 @@ def test_resubmission_supersedes_old_batch_and_advances_nonce() -> None:
         assert len(manager._inflight) == 1
     finally:
         manager.close()
+
+
+class _DrainClient(_Client):
+    async def activate(self, *args, **kwargs):
+        return asyncio.create_task(asyncio.sleep(60))
+
+
+def test_abort_cancels_only_unadmitted_usage_drain() -> None:
+    manager = LwdEdgeProbeManager(_config(True), lambda: None)
+    calls: list[tuple[int, int]] = []
+    activity = {"active": 0, "max_active": 0}
+    clients = {
+        target: _DrainClient(target, calls, activity) for target in manager._targets
+    }
+    manager._client = lambda target, _block_size: clients[target]
+
+    def activate_winner():
+        completion = _drain(manager)
+        winner = max(
+            completion.candidates,
+            key=lambda candidate: candidate.normalized_hit_tokens(16),
+        )
+        assert manager.activate(completion, winner.connection_id, winner)
+        return _drain(manager, activated=True)
+
+    try:
+        request = _request()
+        assert manager.submit(request) is LwdProbeSubmission.SUBMITTED
+        activate_winner()
+        first_task = manager._inflight["req"].drain_task
+        manager.abort("req")
+        deadline = time.monotonic() + 1
+        while not first_task.done() and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert first_task.cancelled()
+
+        assert manager.submit(request) is LwdProbeSubmission.SUBMITTED
+        activated = activate_winner()
+        second_task = manager._inflight["req"].drain_task
+        manager.mark_admitted("req", activated.probe_nonce)
+        manager.abort("req")
+        time.sleep(0.01)
+        assert not second_task.done()
+        manager._runtime.cancel_task(second_task)
+    finally:
+        manager.close()
+
+
+def test_admit_marks_usage_drain_only_after_request_notify() -> None:
+    calls = []
+    connection = LwdConnectionId(0, 0, 0)
+    request = SimpleNamespace(request_id="r", lwd_prefix_nonce=7)
+    engine = object.__new__(LwdEdgeEngineCore)
+    engine.scheduler = SimpleNamespace(lwd_admit_request=Mock(return_value=connection))
+    engine._lwd_coord_clients = {}
+    engine._lwd_notify_request = lambda _dp, _request: calls.append("notify")
+    engine._lwd_probe_manager = Mock()
+    engine._lwd_probe_manager.mark_admitted.side_effect = (
+        lambda _rid, _nonce: calls.append("mark")
+    )
+
+    engine._lwd_admit_and_notify(request, connection)
+
+    assert calls == ["notify", "mark"]
+    engine._lwd_probe_manager.mark_admitted.assert_called_once_with("r", 7)
+
+
+def test_admit_validation_failure_cancels_unadmitted_usage_drain() -> None:
+    request = SimpleNamespace(request_id="r", lwd_prefix_nonce=7)
+    engine = object.__new__(LwdEdgeEngineCore)
+    engine.scheduler = SimpleNamespace(
+        lwd_admit_request=Mock(side_effect=ValueError("invalid request")),
+        lwd_edge_cancel_admission=Mock(),
+    )
+    engine._lwd_coord_clients = {}
+    engine._lwd_notify_request = Mock()
+    engine._lwd_probe_manager = Mock()
+
+    with pytest.raises(ValueError, match="invalid request"):
+        engine._lwd_admit_and_notify(request)
+
+    engine._lwd_probe_manager.abort.assert_called_once_with("r")
+    engine._lwd_notify_request.assert_not_called()
+    engine._lwd_probe_manager.mark_admitted.assert_not_called()
+    engine.scheduler.lwd_edge_cancel_admission.assert_called_once_with("r")
+
+
+def test_admit_failure_cancels_unadmitted_usage_drain() -> None:
+    connection = LwdConnectionId(0, 0, 0)
+    request = SimpleNamespace(request_id="r", lwd_prefix_nonce=7)
+    engine = object.__new__(LwdEdgeEngineCore)
+    engine.scheduler = SimpleNamespace(
+        lwd_admit_request=Mock(return_value=connection),
+        lwd_edge_cancel_admission=Mock(),
+    )
+    engine._lwd_coord_clients = {}
+    engine._lwd_notify_request = Mock(side_effect=RuntimeError("notify failed"))
+    engine._lwd_probe_manager = Mock()
+
+    with pytest.raises(RuntimeError, match="notify failed"):
+        engine._lwd_admit_and_notify(request, connection)
+
+    engine._lwd_probe_manager.abort.assert_called_once_with("r")
+    engine._lwd_probe_manager.mark_admitted.assert_not_called()
+    engine.scheduler.lwd_edge_cancel_admission.assert_called_once_with("r")

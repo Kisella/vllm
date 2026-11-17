@@ -70,8 +70,8 @@ def _validate_coord_url(value: str, coord_port: int | None) -> None:
             raise ValueError("[LWD] coord_url host must be a routable endpoint")
     if coord_port is None:
         raise ValueError("[LWD] coord_url requires coord_port on the same DP")
-    if port != coord_port:
-        raise ValueError("[LWD] coord_url port must match the DP coord_port")
+    if port is None or port < 1:
+        raise ValueError("[LWD] coord_url must include a valid explicit port")
 
 
 class _UniqueKeyLoader(yaml.SafeLoader):
@@ -227,7 +227,8 @@ class LwdDP:
     coord_port: LwdPort | None = None
     coord_url: LwdString | None = None
     """Advertised HTTP coordination endpoint; derived from addr/coord_port
-    when omitted. Explicit URLs support DNS, NAT and external gateways."""
+    when omitted. Explicit URLs support DNS, NAT and gateways whose external
+    port differs from coord_port; multiple DPs may share a gateway URL."""
 
     @model_validator(mode="after")
     def normalize_coord_url(self) -> "LwdDP":
