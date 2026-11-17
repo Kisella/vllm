@@ -147,9 +147,7 @@ def test_cancelled_usage_drain_closes_response() -> None:
         response = _Response(b"")
         response.content = _StreamingContent([], block=True)
         client = LwdEdgePrefixClient("http://cloud1:8101", 4, b"tenant-key-16bytes")
-        task = client._start_drain(
-            "req", response, _iter_sse_data(response.content)
-        )
+        task = client._start_drain("req", response, _iter_sse_data(response.content))
 
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
@@ -166,9 +164,7 @@ def test_completed_usage_drain_closes_response() -> None:
         response = _Response(b"")
         response.content = _StreamingContent([b"data: [DONE]\n\n"])
         client = LwdEdgePrefixClient("http://cloud1:8101", 4, b"tenant-key-16bytes")
-        task = client._start_drain(
-            "req", response, _iter_sse_data(response.content)
-        )
+        task = client._start_drain("req", response, _iter_sse_data(response.content))
 
         await task
 

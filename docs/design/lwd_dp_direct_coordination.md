@@ -602,24 +602,24 @@ prefix probe HTTP 请求数从当前“选中一云后的 D 次内部命令”�
 ### 12.1 配置与拓扑
 
 - `vllm/config/lwd/topology.py`
-  - DP endpoint 字段、候选派生、端口/URL/scene 校验，删除旧字段；`instance_links=None` 时派生全互联，显式配置时按原值校验和使用。
+    - DP endpoint 字段、候选派生、端口/URL/scene 校验，删除旧字段；`instance_links=None` 时派生全互联，显式配置时按原值校验和使用。
 - `vllm/config/lwd/coordination.py`
-  - 删除实例级 URL/listen 配置与 legacy normalize。
+    - 删除实例级 URL/listen 配置与 legacy normalize。
 - `vllm/config/lwd/entry.py`、`legacy.py`、`api.py`
-  - 新配置接线，旧 CLI 参数明确报迁移错误。
+    - 新配置接线，旧 CLI 参数明确报迁移错误。
 - `vllm/tools/gen_lwd_topology.py`
-  - 为所有场景生成每 DP 协调端口和 URL，删除 `--control-url/--listen-port` 等实例级 CLI 参数及其派生逻辑。
+    - 为所有场景生成每 DP 协调端口和 URL，删除 `--control-url/--listen-port` 等实例级 CLI 参数及其派生逻辑。
 - `vllm/v1/lwd_control/lwd_comm/lwd_prefix.py`
-  - 新 probe DTO 的 `cloud_id/engine_index` 必填并始终序列化，删除 `engine_index` 缺省为 0 的线上解析。
+    - 新 probe DTO 的 `cloud_id/engine_index` 必填并始终序列化，删除 `engine_index` 缺省为 0 的线上解析。
 
 ### 12.2 云侧
 
 - `vllm/v1/lwd_control/control_cloud_scheduler/lwd_cloud_control.py`
-  - 多 DP listener、`probe_one`、activate/usage 分离、唯一 Bridge、删除 fanout。
+    - 多 DP listener、`probe_one`、activate/usage 分离、唯一 Bridge、删除 fanout。
 - `vllm/v1/lwd_control/control_cloud_scheduler/lwd_cloud_engine.py`
-  - probe key 回显、固定 DP 校验；reservation 仍只在 RequestNotify。
+    - probe key 回显、固定 DP 校验；reservation 仍只在 RequestNotify。
 - `vllm/v1/engine/utils.py`
-  - 保持 per-DP queue 分发，接入多监听启动 ready/failure 生命周期。
+    - 保持 per-DP queue 分发，接入多监听启动 ready/failure 生命周期。
 
 ### 12.3 边侧
 

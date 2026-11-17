@@ -20,7 +20,8 @@ import socket
 import threading
 import time
 from collections.abc import AsyncIterator, Mapping
-from dataclasses import dataclass, field, replace as dataclass_replace
+from dataclasses import dataclass, field
+from dataclasses import replace as dataclass_replace
 from typing import Any
 
 from fastapi import FastAPI, Request
