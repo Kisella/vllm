@@ -18,10 +18,11 @@ The MiniMax-M3-preview config selects a single set of branches:
 """
 
 from collections.abc import Iterable
+from typing import TYPE_CHECKING
 
 import torch
 from torch import nn
-from transformers import PretrainedConfig
+from transformers import PreTrainedConfig
 
 from vllm import _custom_ops as ops
 from vllm import envs
@@ -85,6 +86,7 @@ from vllm.model_executor.models.utils import (
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
+    spec_decode_needs_target_embed,
 )
 from vllm.model_executor.models.vision import run_dp_sharded_mrope_vision_model
 from vllm.models.minimax_m3.amd.indexer_aiter import (
@@ -105,6 +107,12 @@ from vllm.models.minimax_m3.amd.sparse_attention_msa import (
     MiniMaxM3SparseAiterPADecodeMetadata,
     MiniMaxM3SparseAiterPAImpl,
     MiniMaxM3SparseAiterPAPrefillMetadata,
+)
+from vllm.models.minimax_m3.amd.specialized_decode.runtime import (
+    specialized_decode_config,
+)
+from vllm.models.minimax_m3.common.encoder_cudagraph import (
+    MiniMaxM3EncoderCudaGraphMixin,
 )
 from vllm.models.minimax_m3.common.indexer import MiniMaxM3Indexer
 from vllm.models.minimax_m3.common.mm_preprocess import (
@@ -131,10 +139,13 @@ from vllm.v1.kv_cache_interface import (
     is_quantized_kv_cache,
 )
 
+if TYPE_CHECKING:
+    from .specialized_decode.runtime.decode import SpecializedDecode
+
 logger = init_logger(__name__)
 
 
-def _sparse_attention_layer_ids(config: PretrainedConfig) -> set[int]:
+def _sparse_attention_layer_ids(config: PreTrainedConfig) -> set[int]:
     """Layer ids whose attention runs the extra sparse "index" branch."""
     cfg = getattr(config, "sparse_attention_config", None)
     if not cfg:
@@ -145,7 +156,7 @@ def _sparse_attention_layer_ids(config: PretrainedConfig) -> set[int]:
     return {i for i, f in enumerate(freq) if f != 0}
 
 
-def _sparse_attention_layer_ordinals(config: PretrainedConfig) -> dict[int, int]:
+def _sparse_attention_layer_ordinals(config: PreTrainedConfig) -> dict[int, int]:
     """Map each sparse-attention layer id to its ordinal among sparse layers."""
     return {
         lid: ordinal
@@ -153,7 +164,7 @@ def _sparse_attention_layer_ordinals(config: PretrainedConfig) -> dict[int, int]
     }
 
 
-def _should_skip_index_topk(config: PretrainedConfig, layer_id: int) -> bool:
+def _should_skip_index_topk(config: PreTrainedConfig, layer_id: int) -> bool:
     """ATOM ``index_topk_freq`` (cross-layer index sharing).
 
     Only 1 of every ``index_topk_freq`` sparse-attention layers recomputes the
@@ -176,7 +187,7 @@ def _should_skip_index_topk(config: PretrainedConfig, layer_id: int) -> bool:
     return max(ordinal - offset, 0) % freq != 0
 
 
-def _is_moe_layer(config: PretrainedConfig, layer_id: int) -> bool:
+def _is_moe_layer(config: PreTrainedConfig, layer_id: int) -> bool:
     """Whether this layer's MLP is a sparse MoE block (vs a dense MLP)."""
     moe_layer_freq = getattr(config, "moe_layer_freq", None)
     if moe_layer_freq is None:
@@ -184,7 +195,7 @@ def _is_moe_layer(config: PretrainedConfig, layer_id: int) -> bool:
     return moe_layer_freq[layer_id] != 0
 
 
-def _build_rotary_emb(config: PretrainedConfig, head_dim: int):
+def _build_rotary_emb(config: PreTrainedConfig, head_dim: int):
     """Build the (partial NeoX) RoPE, honoring an optional ``rope_scaling`` config.
 
     Without scaling the cos/sin cache is sized to ``max_position_embeddings``
@@ -262,7 +273,7 @@ class MiniMaxM3MLP(nn.Module):
 
     def __init__(
         self,
-        config: PretrainedConfig,
+        config: PreTrainedConfig,
         intermediate_size: int,
         quant_config: QuantizationConfig | None = None,
         reduce_results: bool = True,
@@ -338,7 +349,7 @@ class MiniMaxM3MoE(nn.Module):
 
     def __init__(
         self,
-        config: PretrainedConfig,
+        config: PreTrainedConfig,
         layer_id: int,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
@@ -461,6 +472,7 @@ class MiniMaxM3MoE(nn.Module):
                 self.n_shared_experts if self.is_fused_shared_expert_enabled else None
             ),
             fuse_shared_experts=self.is_fused_shared_expert_enabled,
+            shared_expert_prefix=f"{prefix}.shared_experts",
             quant_config=quant_config,
             prefix=f"{prefix}.experts",
         )
@@ -488,7 +500,7 @@ class MiniMaxM3Attention(nn.Module):
 
     def __init__(
         self,
-        config: PretrainedConfig,
+        config: PreTrainedConfig,
         layer_id: int,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
@@ -623,7 +635,7 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
 
     def __init__(
         self,
-        config: PretrainedConfig,
+        config: PreTrainedConfig,
         layer_id: int,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
@@ -1264,7 +1276,7 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
 class MiniMaxM3DecoderLayer(nn.Module):
     def __init__(
         self,
-        config: PretrainedConfig,
+        config: PreTrainedConfig,
         prefix: str,
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
@@ -1364,10 +1376,14 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
         cache_config = vllm_config.cache_config
         quant_config = vllm_config.quant_config
         self.config = config
+        self.specialized_decode_config = specialized_decode_config(vllm_config)
+        self.specialized_decode: SpecializedDecode | None = None
 
         self.vocab_size = config.vocab_size
 
-        if get_pp_group().is_first_rank:
+        if get_pp_group().is_first_rank or spec_decode_needs_target_embed(
+            vllm_config, include_mtp=vllm_config.use_v2_model_runner
+        ):
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
@@ -1459,6 +1475,14 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
+    def build_specialized_decode(self) -> None:
+        from .specialized_decode.runtime.decode import SpecializedDecode
+
+        assert self.specialized_decode_config is not None
+        self.specialized_decode = SpecializedDecode.build(
+            self, self.specialized_decode_config
+        )
+
     def forward(
         self,
         input_ids: torch.Tensor | None,
@@ -1477,13 +1501,31 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
+        decode = self.specialized_decode
         # EAGLE3 is not yet compatible with pipeline parallel
         aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
-        for idx, layer in enumerate(self.layers[self.start_layer : self.end_layer]):
-            hidden_states, residual = layer(positions, hidden_states, residual)
-            self._maybe_add_hidden_state(
-                aux_hidden_states, idx + 1, hidden_states, residual
-            )
+        if decode is None:
+            for idx, layer in enumerate(self.layers[self.start_layer : self.end_layer]):
+                hidden_states, residual = layer(positions, hidden_states, residual)
+                self._maybe_add_hidden_state(
+                    aux_hidden_states, idx + 1, hidden_states, residual
+                )
+        else:
+            step = decode.plan(positions, intermediate_tensors)
+            failure: Exception | None = None
+            try:
+                layers = self.layers[self.start_layer : self.end_layer]
+                for idx, layer in enumerate(layers):
+                    kernel = step.layer(layer.layer_id) if step else None
+                    hidden_states, residual = (kernel or layer)(
+                        positions, hidden_states, residual
+                    )
+                    self._maybe_add_hidden_state(
+                        aux_hidden_states, idx + 1, hidden_states, residual
+                    )
+            except Exception as err:
+                failure = err
+            decode.after_step(step, failure)
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(
@@ -1654,6 +1696,12 @@ class MiniMaxM3SparseForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
 
+    @staticmethod
+    def get_model_state_cls():
+        from .model_state import MiniMaxM3ModelState
+
+        return MiniMaxM3ModelState
+
     def forward(
         self,
         input_ids: torch.Tensor | None,
@@ -1685,7 +1733,11 @@ class MiniMaxM3SparseForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
     dummy_inputs=MiniMaxM3VLDummyInputsBuilder,
 )
 class MiniMaxM3SparseForConditionalGeneration(
-    nn.Module, SupportsMultiModal, SupportsPP, SupportsEagle3
+    nn.Module,
+    SupportsMultiModal,
+    MiniMaxM3EncoderCudaGraphMixin,
+    SupportsPP,
+    SupportsEagle3,
 ):
     """Top-level (VL) entry point for MiniMax M3.
 
@@ -1738,7 +1790,7 @@ class MiniMaxM3SparseForConditionalGeneration(
         with self._mark_tower_model(vllm_config, {"image", "video"}):
             vision_config = config.vision_config
             self.vision_tower = MiniMaxVLVisionModel(
-                config=PretrainedConfig.from_dict(vision_config),
+                config=PreTrainedConfig.from_dict(vision_config),
                 text_hidden_size=text_hidden_size,
                 projector_hidden_size=projector_hidden_size,
                 quant_config=self.quant_config,
@@ -1873,6 +1925,9 @@ class MiniMaxM3SparseForConditionalGeneration(
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         return self.language_model.compute_logits(hidden_states)
+
+    def get_model_state_cls(self):
+        return self.language_model.get_model_state_cls()
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.language_model.get_expert_mapping()

@@ -35,7 +35,12 @@ import vllm.envs as envs
 from vllm.config.lwd import LwdAPIConfig, resolve_lwd_config
 from vllm.config.lwd.api import parse_endpoint
 from vllm.logger import init_logger
-from vllm.utils.network_utils import get_ip, get_tcp_uri, make_zmq_socket
+from vllm.utils.network_utils import (
+    get_ip,
+    get_tcp_uri,
+    make_zmq_listener,
+    make_zmq_socket,
+)
 
 logger = init_logger(__name__)
 
@@ -610,20 +615,29 @@ def run_attach_api_server(args: Any) -> None:
 
         listen_address, sock = setup_server(args, reuse_port=False)
         bind_ip = get_route_ip(parse_endpoint(plan.endpoint, "--api-server-attach")[0])
+        input_listener = make_zmq_listener(get_tcp_uri(bind_ip, 0), zmq.ROUTER)
+        try:
+            output_listener = make_zmq_listener(get_tcp_uri(bind_ip, 0), zmq.PULL)
+        except BaseException:
+            input_listener.close()
+            raise
         manager = APIServerProcessManager(
             listen_address=listen_address,
             sock=sock,
             args=args,
             num_servers=1,
-            input_addresses=[get_tcp_uri(bind_ip, 0)],
-            output_addresses=[get_tcp_uri(bind_ip, 0)],
+            input_listeners=[input_listener],
+            output_listeners=[output_listener],
             stats_update_address=accepted.get("stats_update_address"),
             client_count=client_count,
             client_indices=[plan.client_index],
         )
         try:
-            inputs, outputs = manager.gather_actual_addresses()
-            client.report_endpoints(plan.client_index, inputs[0], outputs[0])
+            client.report_endpoints(
+                plan.client_index,
+                input_listener.address,
+                output_listener.address,
+            )
             wait_for_completion_or_failure(api_server_manager=manager)
         finally:
             manager.shutdown()
