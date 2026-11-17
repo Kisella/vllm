@@ -62,6 +62,7 @@ from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
     LwdRefillNotify,
     LwdRequestNotify,
     lwd_decode_edge_to_cloud,
+    lwd_decode_reasoning_parser_kwargs,
     lwd_decode_structured_outputs,
 )
 from vllm.v1.lwd_control.lwd_control_diag import LwdControlDiag
@@ -690,6 +691,10 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             sampling_params=sampling_params,
             pooling_params=None,
             block_hasher=block_hasher if local_hasher is not None else None,
+            reasoning_ended=req_notify.reasoning_ended,
+            reasoning_parser_kwargs=lwd_decode_reasoning_parser_kwargs(
+                req_notify.reasoning_parser_kwargs
+            ),
         )
         request.lwd_mrope_positions = req_notify.mrope_positions
         request.lwd_prefix_nonce = req_notify.prefix_nonce
