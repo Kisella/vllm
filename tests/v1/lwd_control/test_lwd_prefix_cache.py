@@ -18,6 +18,9 @@ from vllm.v1.lwd_control.control_cloud_scheduler.lwd_prefix_cache import (
     init_lwd_prefix_cache,
     prefix_start,
 )
+from vllm.v1.lwd_control.control_scheduler.lwd_base_scheduler import (
+    LwdBaseScheduler,
+)
 from vllm.v1.lwd_control.lwd_comm.lwd_prefix import (
     DIGEST_SIZE,
     LwdPrefixManifest,
@@ -67,7 +70,7 @@ def test_reserve_pins_real_blocks_and_freezes_snapshot() -> None:
     assert reservations.reserve(request) == 16
     manager.block_pool.touch.assert_called_once_with([block])
     assert request.lwd_resume_cap_tokens == 16
-    assert reservations.snapshot(request) == (((block, null_block),), 16)
+    assert reservations.snapshot(request) == (((block, null_block),), 16, 0)
 
     reservations.release("r")
     reservations.release("r")
@@ -76,13 +79,13 @@ def test_reserve_pins_real_blocks_and_freezes_snapshot() -> None:
 
 def test_reserve_miss_snapshot_does_not_change_with_cache_growth() -> None:
     block = SimpleNamespace(is_null=False)
-    manager = _manager()
+    manager = _manager(uncached=32)
     reservations = LwdPrefixReservations(manager)
     request = _request()
     assert reservations.reserve(request) == 0
 
     manager.coordinator.find_longest_cache_hit.return_value = (([block],), 16, 0)
-    assert reservations.snapshot(request) == ((), 0)
+    assert reservations.snapshot(request) == ((), 0, 32)
     assert manager.coordinator.find_longest_cache_hit.call_count == 1
 
 
@@ -92,7 +95,7 @@ def test_skip_reading_reserves_zero_without_lookup() -> None:
     request = _request(skip=True)
 
     assert reservations.reserve(request) == 0
-    assert reservations.snapshot(request) == ((), 0)
+    assert reservations.snapshot(request) == ((), 0, 0)
     manager.coordinator.find_longest_cache_hit.assert_not_called()
     manager.block_pool.touch.assert_not_called()
 
@@ -111,9 +114,9 @@ def test_reserve_hit_preserves_floor_and_truncate_preserves_layout() -> None:
     truncated = reservations.truncate((blocks,), 32)
     assert truncated == (blocks[:2],)
     assert len(blocks) == 3
-    assert reservations.reserve_hit(request, truncated, 32) == 32
+    assert reservations.reserve_hit(request, truncated, 32, 48) == 32
     assert request.lwd_resume_cap_tokens == 48
-    assert reservations.snapshot(request) == ((tuple(blocks[:2]),), 32)
+    assert reservations.snapshot(request) == ((tuple(blocks[:2]),), 32, 48)
     assert prefix_start(request, reservations) == 32
 
 
@@ -145,10 +148,10 @@ def test_lwd_kv_and_connector_apis_return_frozen_triple() -> None:
 
     blocks, hit, boundary = manager.get_computed_blocks(request)
     assert blocks.blocks == ((block,),)
-    assert (hit, boundary) == (16, 0)
+    assert (hit, boundary) == (16, 32)
 
     connector_result = manager.get_computed_blocks_for_connector(request)
-    assert connector_result == (blocks, 16, 0, False)
+    assert connector_result == (blocks, 16, 32, False)
 
 
 def test_lwd_connector_missing_snapshot_fails_closed() -> None:
@@ -332,3 +335,44 @@ def test_readmission_clamp_uses_fine_grained_alignment() -> None:
     assert refill_calls == [("r", 2944, 6656, 0)]
     assert "r" in state._lwd_refill_gate
     assert state._lwd_refill_pending["r"].hit_tokens == 2944
+
+
+def test_readmission_preserves_junction_when_arrival_clamps_hit() -> None:
+    groups = ([SimpleNamespace(is_null=False) for _ in range(500)],)
+    reservations = LwdPrefixReservations(_manager())
+    coordinator = SimpleNamespace(cache_hit_alignment_tokens=128)
+    coordinator.find_longest_cache_hit = Mock(return_value=(groups, 6400, 256))
+    state = SimpleNamespace(
+        kv_cache_manager=SimpleNamespace(coordinator=coordinator),
+        lwd_prefix_reservations=reservations,
+        lwd_prefix_hits={},
+        lwd_recv_rows={"r": 3000},
+        _lwd_refill_gate=set(),
+        _lwd_refill_pending={},
+        lwd_refill_sender=Mock(),
+    )
+    request = _request(floor=6400)
+    request.num_prompt_tokens = 6656
+
+    assert LwdCloudScheduler._lwd_prep_prefix_readmission(state, request) is False
+    _, hit, boundary = reservations.snapshot(request)
+    assert (hit, boundary) == (2944, 6656)
+
+
+def test_cloud_scheduler_keeps_sparse_retention_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kv_cache_config = SimpleNamespace(prefix_cache_retention_interval=0)
+
+    def init_base(self, vllm_config, kv_cache_config) -> None:
+        self.vllm_config = vllm_config
+        assert kv_cache_config.prefix_cache_retention_interval == 0
+
+    monkeypatch.setattr(LwdBaseScheduler, "__init__", init_base)
+    vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(enable_prefix_caching=True)
+    )
+
+    LwdCloudScheduler(vllm_config, kv_cache_config)
+
+    assert kv_cache_config.prefix_cache_retention_interval == 0
