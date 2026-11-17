@@ -159,7 +159,7 @@ class LwdParallelGroupsSpec:
 
 
 def lwd_check_parallel_config(vllm_config: VllmConfig) -> None:
-    """Reject at config time what the shared HCCL world cannot host.
+    """Reject at config time what the LWD deployment cannot host.
 
     Every process reads the same topology, so both sides fail at startup,
     before any worker joins the world.
@@ -167,7 +167,7 @@ def lwd_check_parallel_config(vllm_config: VllmConfig) -> None:
     Raises:
         NotImplementedError: A parallel feature or the topology is unsupported.
         ValueError: The tensor parallel size differs from the ranks of each DP
-            of the local instance.
+            of the local instance, or a host edge enables tensor parallelism.
     """
     lwd_config = vllm_config.lwd_config
     assert lwd_config is not None
@@ -193,18 +193,17 @@ def lwd_check_parallel_config(vllm_config: VllmConfig) -> None:
         raise NotImplementedError(
             f"[LWD] not supported in edge-cloud mode: {', '.join(unsupported)}"
         )
+    # The DP layout is deliberately NOT checked here. Its rule is a property of
+    # the role (edge=1, cloud=len(dp)), and the launch value is only available
+    # while the engine is created: an independent non-MoE DP engine resets
+    # `data_parallel_size` to 1, and vLLM rebuilds derived configs afterwards
+    # (`replace`, e.g. the draft model config), so a check on this object would
+    # reject a valid launch. The engine dispatch and the control plane enforce
+    # the rule with the captured launch size instead; both are transport
+    # agnostic.
     if lwd_config.topology.is_host_comm:
-        # Host comm has no shared HCCL world and no topology ranks; the
-        # rank-allocation checks below are device-only. Each DP is an
-        # independent engine launch, so the parallel sizes must match the
-        # local instance's DP count instead.
-        if parallel_config.data_parallel_size != len(lwd_config.instance.dp):
-            raise ValueError(
-                f"[LWD] data parallel size {parallel_config.data_parallel_size} "
-                f"!= {len(lwd_config.instance.dp)} DPs of {lwd_config.role} "
-                f"instance {lwd_config.instance_id} (host comm: one engine "
-                "launch per DP)"
-            )
+        # Host comm has no shared HCCL world and no topology ranks, so the
+        # rank-allocation checks below do not apply.
         return
     # Raises for topologies the shared HCCL world cannot host.
     LwdParallelGroupsSpec.from_topology(lwd_config.topology)
