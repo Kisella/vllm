@@ -132,9 +132,9 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         }
         for dp_idx, params in self._lwd_cloud_params.items():
             if params.prefix_hash_block_size > 0:
-                self._lwd_probe_manager._hash_sizes[dp_idx.cloud_id] = (
-                    params.prefix_hash_block_size
-                )
+                self._lwd_probe_manager._hash_sizes[
+                    (dp_idx.cloud_id, dp_idx.dp_idx)
+                ] = params.prefix_hash_block_size
         self.scheduler.lwd_send_to_cloud = self._lwd_send_to_cloud
         self.scheduler.lwd_refill_abort = self._lwd_abort_refill
         self.is_pooling_model = True
@@ -340,12 +340,18 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         completion: LwdProbeCompletion | None = None,
     ) -> None:
         preferred = self._lwd_preferred_connection(completion)
+        if completion is not None:
+            request.lwd_prefix_nonce = completion.probe_nonce
         request.lwd_prefix_probe_succeeded = False
         if completion is not None and completion.chain is not None:
             self._lwd_probe_chains[request.request_id] = completion.chain
         if completion is not None and completion.result is not None:
             coordination = self.lwd_config.coordination
-            placement_only = coordination is not None and coordination.placement_only
+            placement_only = (
+                (coordination is not None and coordination.placement_only)
+                or not self._lwd_prefix_enabled
+                or request.skip_reading_prefix_cache
+            )
             request.lwd_prefix_probe_succeeded = not placement_only
             hit = 0 if placement_only else completion.result.hit_tokens
             hit = min(max(hit, 0), max(request.num_prompt_tokens - 1, 0))
@@ -361,25 +367,52 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
     def _lwd_preferred_connection(
         self, completion: LwdProbeCompletion | None
     ) -> LwdConnectionId | None:
-        if completion is None or completion.result is None:
+        if completion is None or not completion.activated:
             return None
-        cloud_id = completion.cloud_id
-        engine = completion.engine_index
-        if engine is not None:
-            candidate = LwdConnectionId(self.lwd_config.instance_id, cloud_id, engine)
-            if candidate in self._lwd_clouds:
-                return candidate
-        return next(
-            (
-                connection_id
-                for connection_id in sorted(self._lwd_clouds)
-                if connection_id.cloud_id == cloud_id
-            ),
-            None,
-        )
+        return completion.connection_id
 
     def _lwd_drain_probe_completions(self) -> None:
         for completion in self._lwd_probe_manager.drain():
+            if not completion.activated:
+                if not completion.candidates:
+                    lwd_logger.warning(
+                        "[edge-probe] all candidates failed req=%s targets=%s; "
+                        "using full prefill",
+                        completion.request.request_id,
+                        completion.failed_targets,
+                    )
+                hits = {
+                    candidate.connection_id: candidate.normalized_hit_tokens(
+                        completion.request.num_prompt_tokens
+                    )
+                    for candidate in completion.candidates
+                }
+                target = self.scheduler.lwd_select_probe_target(
+                    completion.request, hits
+                )
+                candidate = next(
+                    (
+                        item
+                        for item in completion.candidates
+                        if item.connection_id == target
+                    ),
+                    None,
+                )
+                if not self._lwd_probe_manager.activate(completion, target, candidate):
+                    lwd_logger.warning(
+                        "[edge-probe] stale activation req=%s ignored",
+                        completion.request.request_id,
+                    )
+                continue
+            if completion.activation_error is not None:
+                lwd_logger.error(
+                    "[edge-probe] activate failed req=%s target=%s: %s",
+                    completion.request.request_id,
+                    completion.connection_id,
+                    completion.activation_error,
+                )
+                self._lwd_abort_internally(completion.request)
+                continue
             self._lwd_add_request_after_probe(completion.request, completion)
 
     def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
