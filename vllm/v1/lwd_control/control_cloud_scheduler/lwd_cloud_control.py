@@ -319,13 +319,19 @@ class LwdCloudControlBridge:
 class LwdCloudControlProcessor:
     """Child-side non-blocking command poll using read-only prefix peeks."""
 
-    def __init__(self, pending_queue: Any, event_queue: Any) -> None:
+    def __init__(
+        self,
+        pending_queue: Any,
+        event_queue: Any,
+        poll_budget: int = _CLOUD_PROBE_POLL_BUDGET,
+    ) -> None:
         self._pending_queue = pending_queue
         self._event_queue = event_queue
+        self._poll_budget = poll_budget
 
     def poll(self, coordinator: Any) -> int:
         consumed = 0
-        while consumed < _CLOUD_PROBE_POLL_BUDGET:
+        while consumed < self._poll_budget:
             try:
                 command = self._pending_queue.get_nowait()
             except queue.Empty:

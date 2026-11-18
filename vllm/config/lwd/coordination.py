@@ -17,6 +17,7 @@ class LwdCoordinationConfig:
     tenant_key_file: LwdString | None = None
     consumer_id: LwdString | None = None
     listen_host: LwdString = "0.0.0.0"
+    probe_poll_budget: Annotated[int, Field(strict=True, gt=0)] = 32
     instance_id: LwdString = "cloud-0"
     connect_timeout: Annotated[float, Field(strict=True, gt=0, allow_inf_nan=False)] = (
         10.0

@@ -190,6 +190,7 @@ clouds:
     coordination: &cloud_coord
       enabled: true
       listen_host: 0.0.0.0
+      probe_poll_budget: 32
       probe_timeout: 25.0
       enforce_mm_abi_match: true
     dp:
@@ -454,7 +455,7 @@ listener(dp_idx)
 
 - `command_queues` 顺序继续与 cloud-local `dp_idx` 一致。
 - `event_queue` 继续共享，probe event 带 DP/probe key，usage event 带 canonical request ID、DP 和 nonce。
-- 每个 probe 命令携带统一 deadline；云 EngineCore 每轮最多处理 32 条命令，过期命令返回失败且不再 `peek`。本轮后仍有 backlog 时必须补自身 WAKEUP，不能丢弃未过期命令或依赖恰好还有旧唤醒。
+- 每个 probe 命令携带统一 deadline；云 EngineCore 每轮最多处理 `probe_poll_budget` 条命令（默认 32，YAML 可配置为正整数），过期命令返回失败且不再 `peek`。本轮后仍有 backlog 时必须补自身 WAKEUP，不能丢弃未过期命令或依赖恰好还有旧唤醒。
 - 不为每个 listener 创建独立 EngineCore command queue，避免 EngineCore 多消费者。
 - listener 启动失败必须使云实例启动失败；不能只启动部分 DP 后仍宣称服务 ready。
 - 所有监听完成 bind 后再发布 ready；关闭时先停止接入，再取消 pending future，最后关闭 Bridge 和队列。

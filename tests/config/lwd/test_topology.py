@@ -370,6 +370,17 @@ def test_coord_url_is_derived_and_available_on_every_connection() -> None:
         assert cloud.coord_port == 8100 + cloud.dp_idx
 
 
+def test_probe_poll_budget_yaml_config() -> None:
+    raw = topology_payload("s1_single_instance_1dp.yaml")
+    coordination = raw["clouds"][0]["coordination"]
+    assert LwdTopology.from_dict(raw).clouds[0].coordination.probe_poll_budget == 32
+    coordination["probe_poll_budget"] = 2
+    assert LwdTopology.from_dict(raw).clouds[0].coordination.probe_poll_budget == 2
+    coordination["probe_poll_budget"] = 0
+    with pytest.raises(ValueError):
+        LwdTopology.from_dict(raw)
+
+
 def test_explicit_gateway_coord_url_and_ipv6_derivation() -> None:
     raw = topology_payload("s1_single_instance_1dp.yaml")
     dp = raw["clouds"][0]["dp"][0]

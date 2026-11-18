@@ -371,6 +371,32 @@ def test_processor_poll_budget_preserves_remaining_commands() -> None:
     assert event_queue.qsize() == 33
 
 
+def test_processor_custom_poll_budget_preserves_remaining_commands() -> None:
+    pending_queue: queue.Queue[Any] = queue.Queue()
+    event_queue: queue.Queue[Any] = queue.Queue()
+    manifest = _manifest("custom-budget")
+    for index in range(3):
+        pending_queue.put(
+            {
+                "type": "probe",
+                "manifest": manifest,
+                "reply_key": f"custom-budget#{index}",
+                "engine_index": 0,
+                "deadline": time.monotonic() + 60,
+            }
+        )
+    coordinator = Mock()
+    coordinator.peek.return_value = _result("custom-budget", 0, 0)
+    processor = LwdCloudControlProcessor(pending_queue, event_queue, poll_budget=2)
+
+    assert processor.poll(coordinator) == 2
+    assert pending_queue.qsize() == 1
+    assert event_queue.qsize() == 2
+    assert processor.poll(coordinator) == 1
+    assert pending_queue.empty()
+    assert event_queue.qsize() == 3
+
+
 def test_probe_result_requires_and_serializes_explicit_dp_identity() -> None:
     result = _result("r", 1, 0)
     headers = result.to_headers()
