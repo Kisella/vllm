@@ -52,6 +52,19 @@ def test_lwd_state_owns_fixed_buffers_and_captures_logits(tmp_path) -> None:
     assert state.take_lwd_sample_logits() is None
 
 
+def test_lwd_state_prepares_dummy_embeds_without_local_mm_inputs(tmp_path) -> None:
+    config = VllmConfig(model_config=_model_config(tmp_path))
+    state = LwdCloudModelState(config, _EmbeddingModel(), None, torch.device("cpu"))
+    assert not state.supports_mm_inputs
+    assert state.prompt_embeds_state is None
+
+    model_inputs = state.prepare_dummy_inputs(num_reqs=1, num_tokens=3)
+
+    inputs_embeds = model_inputs["inputs_embeds"]
+    assert inputs_embeds.shape == (3, 2)
+    assert inputs_embeds.data_ptr() == state.remote_inputs_embeds.data_ptr()
+
+
 def test_default_state_delegates_sample_logits_to_model(tmp_path) -> None:
     config = VllmConfig(model_config=_model_config(tmp_path))
     state = DefaultModelState(config, _EmbeddingModel(), None, torch.device("cpu"))

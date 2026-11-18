@@ -3,6 +3,7 @@
 
 
 from collections.abc import Callable
+from typing import Any
 
 import torch
 
@@ -87,6 +88,11 @@ class LwdCloudModelStateMixin(DefaultModelState):
 
     def dummy_inputs_embeds(self, num_tokens: int) -> torch.Tensor:
         return self.remote_inputs_embeds[:num_tokens]
+
+    def prepare_dummy_inputs(self, num_reqs: int, num_tokens: int) -> dict[str, Any]:
+        model_inputs = super().prepare_dummy_inputs(num_reqs, num_tokens)
+        model_inputs["inputs_embeds"] = self.dummy_inputs_embeds(num_tokens)
+        return model_inputs
 
     def prepare_inputs_embeds(
         self,
