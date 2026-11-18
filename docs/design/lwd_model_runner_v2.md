@@ -101,7 +101,13 @@ V2 在加载前拒绝非标准 MTP、batch-sharded sampling、PCP/DCP>1 和 DBO�
 
 通用 Mamba hybrid 使用 `LwdAscendCloudMambaHybridModelState` 组合 LWD 与原生 Mamba 行为；dense 使用 `LwdAscendCloudModelState`。模型自定义 state 始终优先。
 
-### 5.2 边端
+### 5.2 正式社区接口
+
+- `ModelState.compute_sample_logits()` 统一委托模型计算并调用 `capture_sample_logits()`。默认捕获为空实现，LWD 只覆写捕获方法；Ascend 在裁剪后再次通过同一接口捕获，不再探测 LWD 私有方法。
+- `GPUModelRunner.create_model_state()` 和 `create_speculator()` 是组件选择接缝。LWD 通过“原生 state 类型到 LWD state 类型”的映射选择实现，模型显式提供的 state 始终优先，原生工厂不再判断 `lwd_config`。
+- `AsyncModelRunnerOutput.get_model_runner_output()` 在不等待异步拷贝的情况下返回内部输出，worker 与 executor 共用该公开接口，不再保留 `_model_runner_output` 私有别名。EP fault 查询保持原生行为，不因 LWD 被跳过。
+
+### 5.3 边端
 
 边端不进入原生 decoder/sample 主流程，worker 直调 EMBED/UNEMBED：
 
@@ -166,7 +172,7 @@ worker 对每个 payload：
 - 输出 rank 将全部连接的 device meta 放入 `lwd_down_carriers`，ready events 按连接保存；
 - executor output thread 等待事件并收割 host meta，scheduler 最终看到与 V1 相同的多连接载体。
 
-V2 `AsyncOutput._model_runner_output` 只读兼容属性保证 worker 与 executor 操作同一个内部 `ModelRunnerOutput`，不新增第二套 DOWN carrier。
+`AsyncModelRunnerOutput.get_model_runner_output()` 提供内部 `ModelRunnerOutput` 的公开访问，worker 与 executor 操作同一个对象，不新增第二套 DOWN carrier 或私有兼容别名。
 
 ## 8. MTP、placeholder 与 penalties
 
@@ -202,6 +208,7 @@ MTP 复用公共 speculator 流程，Ascend 只覆写模型加载和图管理。
 6. MTP/penalties：右移窗口、lookahead 缺失拒绝、零占位不制造 prompt penalty。
 7. AsyncOutput：carrier 挂载、ready event 收割、`get_output()` 后仍保留。
 8. 既有能力：prefix/refill/preemption/abort、host staging、structured output 和原生 waiting queue 回归。
+9. 正式接口：EP fault 查询、公开异步输出、默认/LWD logits 捕获、runner 选择 state/speculator 及模型专用 state 优先级。
 
 ### 10.2 新主线 NPU ST 出口
 
@@ -221,6 +228,7 @@ MTP 复用公共 speculator 流程，Ascend 只覆写模型加载和图管理。
 - Ascend 云端薄适配、边端原生 V2、通用 Mamba state；
 - 所有 TP rank 的 prompt broadcast、TP-local DOWN endpoint、rejected tail 修复；
 - 公共多连接 UP/DOWN 与 Ascend source-rank 数据面适配；
+- 正式社区接口：ModelState logits、runner state/speculator 选择、公开异步输出与 EP fault 修复；
 - 本文档与两仓模块地图。
 
 临时诊断及其 revert、非 LWD 的 QSA/社区修复不纳入本次迁移。
