@@ -58,6 +58,16 @@ class _DoneMq:
         raise TimeoutError
 
 
+def _append_and_return(items: list[Any], marker: Any, result: Any) -> Any:
+    items.append(marker)
+    return result
+
+
+def _extend_and_return(items: list[Any], values: Any) -> Any:
+    items.extend(values)
+    return values
+
+
 def _request(
     request_id: str = "p",
     prompt: int = 10,
@@ -192,14 +202,35 @@ def test_fragment_waits_but_final_and_budget_limited_windows_run() -> None:
     assert [(w.start, w.num_rows) for w in final_window] == [(2, 8)]
 
 
+def test_nonfinal_window_requires_lookahead_arrival() -> None:
+    scheduler = _scheduler(_request())
+    scheduler._lwd_prefill_lookahead_tokens = 1
+    scheduler.lwd_recv_rows["p"] = 5
+
+    assert scheduler._lwd_collect_prefill_windows(room=3) == []
+
+    scheduler.lwd_recv_rows["p"] = 6
+    windows = scheduler._lwd_collect_prefill_windows(room=3)
+    assert [(window.start, window.num_rows) for window in windows] == [(2, 3)]
+    scheduler._lwd_verify_w2(
+        SimpleNamespace(num_scheduled_tokens={"p": 3}), windows, decode_exact=0
+    )
+
+
 def test_decode_exact_is_accounted_before_prefill_windows() -> None:
     scheduler = _scheduler(_request())
     scheduler.max_num_scheduled_tokens = 10
-    calls = []
+    calls: list[Any] = []
     out = SchedulerOutput.make_empty()
-    scheduler._lwd_collect_decode_requests = lambda: calls.append("decode") or ["d"]
-    scheduler._lwd_compute_decode_consumption = lambda ids: calls.append(ids) or 3
-    scheduler._lwd_collect_prefill_windows = lambda room: calls.append(room) or []
+    scheduler._lwd_collect_decode_requests = lambda: _append_and_return(
+        calls, "decode", ["d"]
+    )
+    scheduler._lwd_compute_decode_consumption = lambda ids: _append_and_return(
+        calls, ids, 3
+    )
+    scheduler._lwd_collect_prefill_windows = lambda room: _append_and_return(
+        calls, room, []
+    )
     scheduler._lwd_schedule = lambda ids: out
 
     assert scheduler._lwd_schedule_step() is out
@@ -327,7 +358,7 @@ def test_preemption_recomputes_window_from_zero_and_clears_cap() -> None:
     scheduler = _scheduler(request)
     scheduler.max_num_scheduled_tokens = 10
     scheduler.lwd_recv_rows["p"] = 10
-    calls = []
+    calls: list[Any] = []
 
     def schedule(
         request_ids: list[str], *, token_budget_cap: int | None = None
@@ -435,7 +466,7 @@ def test_range_notify_posts_only_extended_hint(monkeypatch: pytest.MonkeyPatch) 
     from vllm_ascend.worker.lwd_cloud_model import lwd_pre_recv
 
     engine = _engine({"a": 8, "b": 6})
-    posted = []
+    posted: list[Any] = []
     monkeypatch.setattr(
         lwd_pre_recv,
         "make_recv_hint",
@@ -487,11 +518,11 @@ def test_done_arrivals_merge_by_max_and_keep_watermark_items(
     }
     engine._lwd_ledger.track_range(_CONNECTION, 1, ["a"])
     engine._lwd_ledger.track_range(_CONNECTION, 2, ["a", "b"])
-    watermark = []
+    watermark: list[Any] = []
     monkeypatch.setattr(
         lwd_pre_recv,
         "record_irecv_completions",
-        lambda items: watermark.extend(items) or list(items),
+        lambda items: _extend_and_return(watermark, items),
     )
 
     engine._lwd_drain_irecv_completions()
@@ -567,7 +598,7 @@ def test_abort_before_mixed_range_still_posts_complete_hint(
     engine.input_queue = queue.Queue()
     engine._lwd_ledger.track_range(_CONNECTION, 6, ["a"])
     engine._lwd_handle_abort_notify(LwdAbortNotify("a"))
-    posted = []
+    posted: list[Any] = []
     monkeypatch.setattr(
         lwd_pre_recv,
         "make_recv_hint",
@@ -653,11 +684,11 @@ def test_worker_error_fails_connection_without_advancing_failed_item(
     engine._lwd_fail_connection = lambda connection, seqno, error: failures.append(
         f"seqno={seqno}: {error}"
     )
-    watermark = []
+    watermark: list[Any] = []
     monkeypatch.setattr(
         lwd_pre_recv,
         "record_irecv_completions",
-        lambda items: watermark.extend(items) or list(items),
+        lambda items: _extend_and_return(watermark, items),
     )
 
     engine._lwd_drain_irecv_completions()
