@@ -7,6 +7,7 @@ from transformers import PreTrainedConfig
 from vllm.config import VllmConfig
 from vllm.config.model import ModelConfig
 from vllm.v1.worker.gpu.lwd.model_state import LwdCloudModelState
+from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 
 
 class _EmbeddingModel(torch.nn.Module):
@@ -49,3 +50,12 @@ def test_lwd_state_owns_fixed_buffers_and_captures_logits(tmp_path) -> None:
 
     state.clear_lwd_sample_logits()
     assert state.take_lwd_sample_logits() is None
+
+
+def test_default_state_delegates_sample_logits_to_model(tmp_path) -> None:
+    config = VllmConfig(model_config=_model_config(tmp_path))
+    state = DefaultModelState(config, _EmbeddingModel(), None, torch.device("cpu"))
+
+    logits = state.compute_sample_logits(torch.tensor([1.0, 2.0]))
+
+    assert logits.tolist() == [2.0, 4.0]

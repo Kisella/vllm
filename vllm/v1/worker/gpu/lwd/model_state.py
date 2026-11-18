@@ -124,13 +124,8 @@ class LwdCloudModelStateMixin(DefaultModelState):
         )
         return self.remote_inputs_embeds[: input_batch.num_tokens_after_padding]
 
-    def capture_lwd_sample_logits(self, logits: torch.Tensor) -> None:
+    def capture_sample_logits(self, logits: torch.Tensor) -> None:
         self._lwd_sample_logits = logits
-
-    def compute_sample_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        logits = self.model.compute_logits(hidden_states)
-        self.capture_lwd_sample_logits(logits)
-        return logits
 
     def clear_lwd_sample_logits(self) -> None:
         self._lwd_sample_logits = None

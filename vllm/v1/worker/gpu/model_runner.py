@@ -1635,7 +1635,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             logits = logits[:, : self.vocab_size]
         else:
             sample_hidden_states = hidden_states[input_batch.logits_indices]
-            logits = self.model.compute_logits(sample_hidden_states)
+            logits = self.model_state.compute_sample_logits(sample_hidden_states)
 
         invalid_drafts = None
         # A diffusion prefill has no logit rows even when a bitmask row

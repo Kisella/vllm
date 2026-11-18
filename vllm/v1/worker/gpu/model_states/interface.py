@@ -242,6 +242,16 @@ class ModelState(ABC):
     ) -> dict[str, Any]:
         raise NotImplementedError
 
+    def compute_sample_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Compute sample logits and let the state capture the exact rows used."""
+        logits = self.model.compute_logits(hidden_states)
+        self.capture_sample_logits(logits)
+        return logits
+
+    def capture_sample_logits(self, logits: torch.Tensor) -> None:
+        """Capture logits after backend-specific row selection or trimming."""
+        return None
+
     def custom_sampler(self, sampler: Any) -> tuple[Any, Any] | None:
         """Wrap or replace the default sampler.
 
