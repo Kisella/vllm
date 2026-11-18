@@ -355,6 +355,12 @@ class ModelRunnerOutput:
 
 # ModelRunnerOutput wrapper for async scheduling.
 class AsyncModelRunnerOutput(ABC):
+    model_runner_output: ModelRunnerOutput
+
+    def get_model_runner_output(self) -> ModelRunnerOutput:
+        """Return the inner output without waiting for asynchronous copies."""
+        return self.model_runner_output
+
     @abstractmethod
     def get_output(self) -> ModelRunnerOutput:
         """Get the ModelRunnerOutput for this async output.

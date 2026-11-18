@@ -1099,7 +1099,11 @@ class WorkerProc:
         worker_response_mq. If the output is an Exception, it is
         converted to a FAILURE response.
         """
-        inner = getattr(output, "_model_runner_output", output)
+        inner: Any = (
+            output.get_model_runner_output()
+            if isinstance(output, AsyncModelRunnerOutput)
+            else output
+        )
         ready_events = getattr(inner, "lwd_meta_ready_events", None)
         if ready_events is not None:
             delattr(inner, "lwd_meta_ready_events")
@@ -1158,9 +1162,8 @@ class WorkerProc:
         n_dev = meta_dev.numel()
         n_seg = len(seg_lens_host) if seg_lens_host is not None else 0
         n_meta = n_dev + n_seg
-        buffers = getattr(self, "_lwd_harvest_pinned_by_connection", None)
-        if buffers is None:
-            buffers = self._lwd_harvest_pinned_by_connection = {}
+        buffers: dict[Any, Any] = getattr(self, "_lwd_harvest_pinned_by_connection", {})
+        self._lwd_harvest_pinned_by_connection = buffers
         buf = buffers.get(connection)
         if buf is None or buf.numel() < n_meta:
             buf = buffers[connection] = torch.empty(

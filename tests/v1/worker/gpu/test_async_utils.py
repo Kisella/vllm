@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from unittest.mock import Mock
+
 import torch
 
 from vllm.v1.outputs import ModelRunnerOutput
@@ -8,7 +10,7 @@ from vllm.v1.worker.gpu.async_utils import AsyncOutput
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 
 
-def test_async_output_exposes_v1_compatible_inner_output(monkeypatch) -> None:
+def _make_async_output(monkeypatch, check_ep_fault: bool) -> AsyncOutput:
     class _Stream:
         def wait_stream(self, _stream) -> None:
             pass
@@ -23,7 +25,6 @@ def test_async_output_exposes_v1_compatible_inner_output(monkeypatch) -> None:
     monkeypatch.setattr(torch.cuda, "Stream", lambda: _Stream())
     monkeypatch.setattr(torch.cuda, "Event", lambda **_kwargs: _Event())
     monkeypatch.setattr(torch.cuda, "set_stream", lambda _stream: None)
-
     inner = ModelRunnerOutput(req_ids=[], req_id_to_index={})
     sampler_output = SamplerOutput(
         sampled_token_ids=torch.empty((0, 1), dtype=torch.int64),
@@ -32,14 +33,33 @@ def test_async_output_exposes_v1_compatible_inner_output(monkeypatch) -> None:
         num_sampled=torch.empty(0, dtype=torch.int32),
         num_rejected=torch.empty(0, dtype=torch.int32),
     )
-    output = AsyncOutput(
+    return AsyncOutput(
         model_runner_output=inner,
         sampler_output=sampler_output,
         num_sampled_tokens=torch.empty(0, dtype=torch.int32),
         main_stream=torch.cuda.Stream(),
         copy_stream=torch.cuda.Stream(),
-        check_ep_fault=False,
+        check_ep_fault=check_ep_fault,
         pending_aux_output=None,
     )
 
-    assert output._model_runner_output is inner
+
+def test_async_output_exposes_inner_output_through_public_api(monkeypatch) -> None:
+    output = _make_async_output(monkeypatch, check_ep_fault=False)
+
+    assert output.get_model_runner_output() is output.model_runner_output
+
+
+def test_async_output_queries_ep_fault_when_enabled(monkeypatch) -> None:
+    manager = Mock()
+    manager.query_fault.return_value = torch.tensor([True])
+    monkeypatch.setattr(
+        "vllm.v1.worker.gpu.async_utils.get_ep_all2all_manager",
+        lambda: manager,
+    )
+
+    output = _make_async_output(monkeypatch, check_ep_fault=True)
+
+    manager.query_fault.assert_called_once_with()
+    assert output._has_fault is not None
+    assert output._has_fault.item() is True
