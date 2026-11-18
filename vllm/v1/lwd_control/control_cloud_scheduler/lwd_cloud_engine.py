@@ -948,7 +948,7 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             self._lwd_engine_index,
             len(scheduler.running),
             len(scheduler.waiting),
-            len(scheduler.skipped_waiting),
+            len(scheduler.deferred_waiting),
             len(scheduler.requests),
             scheduler.current_step,
             block_pool.get_usage() * 100.0,

@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """Common base class for Lwd edge/cloud schedulers: phase predicates and
-the visible-set scheduling primitive (three-queue remove - schedule -
+the visible-set scheduling primitive (waiting-queue remove - schedule -
 reassemble).
 
 Inherits AsyncScheduler; native scheduling behavior and isinstance checks
@@ -94,17 +94,17 @@ class LwdBaseScheduler(AsyncScheduler):
         chunk_threshold: int | None = None,
     ) -> SchedulerOutput:
         """Isolated scheduling: schedule only the requests named by req_ids
-        -- the rest are temporarily removed from the three queues and
+        -- the rest are temporarily removed from the waiting queues and
         hidden, then reassembled into their original queues after the step
-        (visible-set mechanism).
+        (visible-set mechanism). Deferred bookkeeping is isolated as well.
 
-        waiting/skipped sources go through native admission
+        waiting/kv-holding sources go through native admission
         (allocate/state transition/accounting all intact), running sources
         go through resume. Reassembly: still-scheduled requests are
         appended after the hidden running, non-preempted waiting requests
         are appended after the hidden waiting, and preempted requests are
-        prepended in their native post-schedule order. Skipped requests go
-        to the skipped queue head.
+        prepended in their native post-schedule order. Deferred requests go
+        to the head of their native waiting queue.
 
         token_budget_cap / chunk_threshold only tighten, never loosen, the
         native limits: the edge side passes a cap to reproduce the picker's
@@ -118,15 +118,21 @@ class LwdBaseScheduler(AsyncScheduler):
         picked = {self.requests[req_id] for req_id in req_ids}
         from_running = [req for req in self.running if req in picked]
         from_waiting = [req for req in self.waiting if req in picked]
-        from_skipped = [req for req in self.skipped_waiting if req in picked]
+        from_kv_holding = [req for req in self.kv_holding_waiting if req in picked]
         self.running = [req for req in self.running if req not in picked]
         self.waiting.remove_requests(from_waiting)
-        self.skipped_waiting.remove_requests(from_skipped)
-        saved = (self.running, self.waiting, self.skipped_waiting)
+        self.kv_holding_waiting.remove_requests(from_kv_holding)
+        saved = (
+            self.running,
+            self.waiting,
+            self.kv_holding_waiting,
+            self.deferred_waiting,
+        )
         # Put the visible set in place and schedule it alone
         self.running = from_running
         self.waiting = self._lwd_new_queue(from_waiting)
-        self.skipped_waiting = self._lwd_new_queue(from_skipped)
+        self.kv_holding_waiting = self._lwd_new_queue(from_kv_holding)
+        self.deferred_waiting = {req for req in saved[3] if req in picked}
         saved_cap = self.max_num_running_reqs
         self.max_num_running_reqs = max(0, saved_cap - len(saved[0]))
         saved_budget = self.max_num_scheduled_tokens
@@ -148,7 +154,12 @@ class LwdBaseScheduler(AsyncScheduler):
             self.max_num_running_reqs = saved_cap
             self.max_num_scheduled_tokens = saved_budget
             sched_cfg.long_prefill_token_threshold = saved_threshold
-            post = (self.running, self.waiting, self.skipped_waiting)
+            post = (
+                self.running,
+                self.waiting,
+                self.kv_holding_waiting,
+                self.deferred_waiting,
+            )
             preempted_req_ids = (
                 (out.preempted_req_ids or set()) if out is not None else set()
             )
@@ -159,12 +170,22 @@ class LwdBaseScheduler(AsyncScheduler):
                     preempted.append(request)
                 else:
                     rest.append(request)
-            self.running, self.waiting, self.skipped_waiting = saved
+            deferred = [request for request in rest if request in post[3]]
+            rest = [request for request in rest if request not in post[3]]
+            (
+                self.running,
+                self.waiting,
+                self.kv_holding_waiting,
+                self.deferred_waiting,
+            ) = saved
             self.running += post[0]
             self.waiting.extend(rest)
+            for request in reversed(deferred):
+                self.waiting.prepend_request(request)
             for request in reversed(preempted):
                 self.waiting.prepend_request(request)
-            self.skipped_waiting.prepend_requests(post[2])
+            self.kv_holding_waiting.prepend_requests(post[2])
+            self.deferred_waiting.update(post[3])
         return out
 
     def _free_request(

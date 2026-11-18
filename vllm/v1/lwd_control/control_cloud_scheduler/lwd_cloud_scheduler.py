@@ -148,7 +148,7 @@ class LwdCloudScheduler(LwdBaseScheduler):
                 LwdReqPhase.DECODE,
                 self.running,
                 self.waiting,
-                self.skipped_waiting,
+                self.kv_holding_waiting,
             )
         ]
 
@@ -255,7 +255,7 @@ class LwdCloudScheduler(LwdBaseScheduler):
         reservations = getattr(self, "lwd_prefix_reservations", None)
         prefix_enabled = getattr(self, "_lwd_prefix_enabled", False)
         requests = list(
-            itertools.chain(self.running, self.waiting, self.skipped_waiting)
+            itertools.chain(self.running, self.waiting, self.kv_holding_waiting)
         )
         grouped: dict[int, list[Request]] = {}
         for request in requests:
