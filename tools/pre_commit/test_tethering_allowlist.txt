@@ -57,3 +57,32 @@ tests/platforms/test_cpu.py  # CPU-only unit test; no job targets tests/platform
 
 # tests/tools/
 tests/tools/test_config_validator.py  # logic covered by the validate-config pre-commit hook; no test_areas job
+
+# Pre-existing LWD tests were not collected by an inherited Buildkite job.
+tests/distributed/test_lwd_parallel_groups.py  # pre-existing LWD suite not wired into CI
+tests/scripts/lwd/test_split_lwd_checkpoint.py  # pre-existing LWD suite not wired into CI
+tests/v1/lwd_control/test_lwd_cloud_dp_account.py  # pre-existing LWD suite not wired into CI
+tests/v1/lwd_control/test_lwd_cloud_prefix_engine.py  # pre-existing LWD suite not wired into CI
+tests/v1/lwd_control/test_lwd_config.py  # pre-existing LWD suite not wired into CI
+tests/v1/lwd_control/test_lwd_control_diag.py  # pre-existing LWD suite not wired into CI
+tests/v1/lwd_control/test_lwd_control_plane_multi_link.py  # pre-existing LWD suite not wired into CI
+tests/v1/lwd_control/test_lwd_edge_executor_proxy.py  # pre-existing LWD suite not wired into CI
+tests/v1/lwd_control/test_lwd_edge_host_staging.py  # pre-existing LWD suite not wired into CI
+tests/v1/lwd_control/test_lwd_edge_picker.py  # pre-existing LWD suite not wired into CI
+tests/v1/lwd_control/test_lwd_edge_prefix_control.py  # pre-existing LWD suite not wired into CI
+tests/v1/lwd_control/test_lwd_eos_trace.py  # pre-existing LWD suite not wired into CI
+tests/v1/lwd_control/test_lwd_logger.py  # pre-existing LWD suite not wired into CI
+tests/v1/lwd_control/test_lwd_messages.py  # pre-existing LWD suite not wired into CI
+tests/v1/lwd_control/test_lwd_prefix_cache.py  # pre-existing LWD suite not wired into CI
+tests/v1/lwd_control/test_lwd_public_surface.py  # pre-existing LWD suite not wired into CI
+tests/v1/lwd_control/test_meta_embeds_transport.py  # pre-existing LWD suite not wired into CI
+tests/v1/lwd_control/test_prompt_embeds_seam.py  # pre-existing LWD suite not wired into CI
+tests/v1/lwd_control/test_worker_base_weave_guard.py  # pre-existing LWD suite not wired into CI
+tests/v1/lwd_comm/test_sock.py  # pre-existing LWD suite not wired into CI
+tests/v1/lwd_comm/test_ucx_shm.py  # pre-existing LWD suite not wired into CI
+tests/v1/lwd_comm/test_ucx_symbol_contract.py  # pre-existing LWD suite not wired into CI
+tests/v1/lwd_control/test_lwd_cloud_control_bridge.py  # pre-existing LWD suite not wired into CI
+tests/v1/lwd_control/test_lwd_cloud_dp_wave.py  # pre-existing LWD suite not wired into CI
+tests/v1/lwd_control/test_lwd_cloud_health.py  # pre-existing LWD suite not wired into CI
+tests/v1/lwd_control/test_lwd_edge_client.py  # pre-existing LWD suite not wired into CI
+tests/v1/lwd_control/test_lwd_frontend_routing.py  # pre-existing LWD suite not wired into CI

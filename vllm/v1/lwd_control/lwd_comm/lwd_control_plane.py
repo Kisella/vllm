@@ -41,6 +41,7 @@ from vllm.v1.lwd_control.lwd_comm.lwd_link_protocol import (
     LwdLinkMessage,
     LwdLinkReject,
     LwdPeer,
+    LwdRunnerKind,
     lwd_decode_link_message,
     lwd_decode_peer,
     lwd_edge_identity,
@@ -105,6 +106,7 @@ class LwdControlPlaneSpec:
     """Global DP size. Read it before non-MoE engine processes reset
     `ParallelConfig.data_parallel_size` to 1."""
     config: LwdControlPlaneConfig = field(default_factory=LwdControlPlaneConfig)
+    runner_kind: LwdRunnerKind = "v1"
 
     def __post_init__(self) -> None:
         if self.instance_id < 0:
@@ -219,6 +221,7 @@ class LwdControlSender:
         Raises:
             LwdPeerNotRegisteredError: `peer` is not registered, or the
                 plane has stopped.
+
         """
         if threading.get_ident() != self._owner_thread:
             raise RuntimeError("LwdControlSender used outside its owner thread")
@@ -275,6 +278,7 @@ class LwdControlPlane(ABC):
 
         Raises:
             LwdControlPlaneStartupError: The link could not be opened.
+
         """
         if self._thread is not None:
             raise RuntimeError("LWD control plane already started")
@@ -586,8 +590,10 @@ class LwdEdgeControlPlane(LwdControlPlane):
                     dp_rank=connection_id.dp_idx,
                     dp_size=cloud_dp_size,
                     session_id=session_id,
+                    runner_kind=spec.runner_kind,
                 ),
                 spec.config.hello_retry_interval_s,
+                spec.runner_kind,
             )
             for connection_id, cloud_dp_size in zip(
                 self._connection_ids, spec.cloud_dp_sizes, strict=True
@@ -625,6 +631,7 @@ class LwdEdgeControlPlane(LwdControlPlane):
 
         Raises:
             LwdHandshakeError: Timeout, rejection, or IO thread failure.
+
         """
         if timeout_s is None:
             timeout_s = self.spec.config.handshake_timeout_s
@@ -744,6 +751,8 @@ class LwdEdgeControlPlane(LwdControlPlane):
             ),
             None,
         )
+        if connection_id is None:
+            return None
         index = self._link_indices.get(connection_id)
         return None if index is None else str(index).encode()
 
@@ -779,7 +788,11 @@ class LwdCloudControlPlane(LwdControlPlane):
     def __init__(self, spec: LwdCloudControlPlaneSpec) -> None:
         super().__init__(spec, spec.bind_endpoint)
         self._handshake = LwdCloudHandshake(
-            spec.instance_id, spec.dp_rank, spec.dp_size, spec.expected_edge_ids
+            spec.instance_id,
+            spec.dp_rank,
+            spec.dp_size,
+            spec.expected_edge_ids,
+            spec.runner_kind,
         )
 
     def _create_transport(self) -> LwdControlTransport:
