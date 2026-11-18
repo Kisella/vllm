@@ -2,9 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+from collections.abc import Callable
+
 import torch
 
 from vllm.config import VllmConfig
+from vllm.config.lwd import LwdConnectionId
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.lwd.cloud_input import (
@@ -39,8 +42,19 @@ class LwdCloudModelStateMixin(DefaultModelState):
         self._lwd_sample_logits: torch.Tensor | None = None
         self._lwd_req_indices: dict[str, int] = {}
 
-    def bind_lwd_prompt_stage(self, prompt_stage: LwdPromptStage | None) -> None:
-        self.lwd_input_assembler.bind_prompt_stage(prompt_stage)
+    def bind_lwd_prompt_stage(
+        self,
+        prompt_stage: LwdPromptStage | None,
+        request_connection: Callable[[str], LwdConnectionId] | None = None,
+        up_src_ranks: dict[LwdConnectionId, int] | None = None,
+        local_rank: int = 0,
+    ) -> None:
+        self.lwd_input_assembler.bind_prompt_stage(
+            prompt_stage,
+            request_connection,
+            up_src_ranks,
+            local_rank,
+        )
 
     def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
         super().add_request(req_index, new_req_data)

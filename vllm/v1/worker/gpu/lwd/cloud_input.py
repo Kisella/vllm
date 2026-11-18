@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from collections.abc import Callable
 from typing import NamedTuple, Protocol
 
 import numpy as np
 import torch
+
+from vllm.config.lwd import LwdConnectionId
 
 
 class LwdCloudBatchView(NamedTuple):
@@ -64,13 +67,28 @@ class LwdCloudInputAssembler:
         self.max_num_tokens = max_num_tokens
         self.enable_lookahead = enable_lookahead
         self.prompt_stage = prompt_stage
+        self._request_connection: Callable[[str], LwdConnectionId] = (
+            lambda _req_id: LwdConnectionId(0, 0, 0)
+        )
+        self._up_src_ranks: dict[LwdConnectionId, int] | None = None
+        self._local_rank = 0
         self._copy_stream: torch.cuda.Stream | None = None
         self._window_device: list[torch.Tensor] | None = None
         self._window_flip = 0
         self._window_used_events: list[torch.cuda.Event | None] = [None, None]
 
-    def bind_prompt_stage(self, prompt_stage: LwdPromptStage | None) -> None:
+    def bind_prompt_stage(
+        self,
+        prompt_stage: LwdPromptStage | None,
+        request_connection: Callable[[str], LwdConnectionId] | None = None,
+        up_src_ranks: dict[LwdConnectionId, int] | None = None,
+        local_rank: int = 0,
+    ) -> None:
         self.prompt_stage = prompt_stage
+        if request_connection is not None:
+            self._request_connection = request_connection
+        self._up_src_ranks = up_src_ranks
+        self._local_rank = local_rank
 
     def align_consumed(self, view: LwdCloudBatchView) -> None:
         if self.prompt_stage is None:
@@ -99,11 +117,15 @@ class LwdCloudInputAssembler:
         for req_state_idx in view.idx_mapping_np:
             if req_state_idx >= 0:
                 next_prompt_embeds[int(req_state_idx)].zero_()
-        plan = self._prompt_plan(view)
-        if not plan:
-            return
-        staged = self._harvest_window(plan, next_prompt_embeds, view)
-        self._inject_window(staged, view, inputs_embeds)
+        grouped: dict[LwdConnectionId, list[LwdPromptWindow]] = {}
+        for window in self._prompt_plan(view):
+            connection = self._request_connection(window.req_id)
+            grouped.setdefault(connection, []).append(window)
+        for connection in sorted(grouped):
+            plan = grouped[connection]
+            staged = self._harvest_window(plan, next_prompt_embeds, view, connection)
+            self._broadcast_lookahead(plan, next_prompt_embeds, view, connection)
+            self._inject_window(staged, view, inputs_embeds)
 
     def _prompt_plan(self, view: LwdCloudBatchView) -> list[LwdPromptWindow]:
         plan: list[LwdPromptWindow] = []
@@ -123,7 +145,9 @@ class LwdCloudInputAssembler:
         plan: list[LwdPromptWindow],
         next_prompt_embeds: torch.Tensor,
         view: LwdCloudBatchView,
+        connection: LwdConnectionId,
     ) -> LwdStagedWindow:
+        del connection
         if self.prompt_stage is None:
             raise RuntimeError("[LWD] prompt stage is required for remote embeddings")
         numel = sum(window.rows for window in plan) * self._elements_per_row()
@@ -206,6 +230,18 @@ class LwdCloudInputAssembler:
     ) -> None:
         del plan, device_payload, embed_offset
 
+    def _lookahead_indices(
+        self,
+        plan: list[LwdPromptWindow],
+        view: LwdCloudBatchView,
+    ) -> list[int]:
+        indices = []
+        for window in plan:
+            next_row = window.start + window.rows
+            if next_row < int(view.prefill_len_np[window.req_index]):
+                indices.append(int(view.idx_mapping_np[window.req_index]))
+        return indices
+
     def _stage_lookahead(
         self,
         plan: list[LwdPromptWindow],
@@ -232,6 +268,15 @@ class LwdCloudInputAssembler:
                 request.host[host_start : host_start + self.hidden_size],
                 non_blocking=True,
             )
+
+    def _broadcast_lookahead(
+        self,
+        plan: list[LwdPromptWindow],
+        next_prompt_embeds: torch.Tensor,
+        view: LwdCloudBatchView,
+        connection: LwdConnectionId,
+    ) -> None:
+        del plan, next_prompt_embeds, view, connection
 
     def _inject_window(
         self,

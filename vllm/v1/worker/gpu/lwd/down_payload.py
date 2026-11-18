@@ -7,6 +7,7 @@ from typing import NamedTuple
 import numpy as np
 import torch
 
+from vllm.config.lwd import LwdConnectionId
 from vllm.v1.worker.gpu.lwd.pinned_staging import LwdPinnedStaging
 from vllm.v1.worker.gpu.lwd.token_rank import LwdTokenRankEncoder
 
@@ -19,6 +20,7 @@ class LwdDownBatch(NamedTuple):
     valid_rows: np.ndarray
     num_draft_tokens_per_req: np.ndarray | None = None
     num_sampled_tokens: torch.Tensor | None = None
+    connection: LwdConnectionId = LwdConnectionId(0, 0, 0)
 
 
 class LwdDownPayload(NamedTuple):
@@ -27,6 +29,7 @@ class LwdDownPayload(NamedTuple):
     seg_lens_host: list[int] | None
     ready_event: torch.cuda.Event
     req_ids: list[str]
+    connection: LwdConnectionId = LwdConnectionId(0, 0, 0)
 
 
 class LwdDownSelection(NamedTuple):
@@ -82,6 +85,7 @@ class LwdDownPayloadBuilder:
             seg_lens_host,
             ready_event,
             req_ids,
+            batch.connection,
         )
 
     def _pack_plain_rows(

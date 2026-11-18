@@ -7,8 +7,10 @@ import numpy as np
 import torch
 
 from vllm.config import VllmConfig
+from vllm.config.lwd import LwdConnectionId
 from vllm.distributed.parallel_state import get_tp_group
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
+from vllm.v1.lwd_control.lwd_comm.lwd_id_adapter import parse_edge_id
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.lwd.cloud_input import LwdCloudBatchView
 from vllm.v1.worker.gpu.lwd.down_payload import (
@@ -48,7 +50,8 @@ class LwdCloudModelRunnerMixin(GPUModelRunner):
     def init_lwd_cloud_runner(self, worker: Any) -> None:
         _validate_lwd_v2_config(self.vllm_config)
         self.worker = worker
-        self._lwd_pending_down_payload: LwdDownPayload | None = None
+        self._lwd_pending_down_payload: list[LwdDownPayload] | None = None
+        self._lwd_request_connections: dict[str, LwdConnectionId] = {}
         self._lwd_down_builder = LwdDownPayloadBuilder(self.device)
 
     def load_model(self, *args: Any, **kwargs: Any) -> None:
@@ -59,7 +62,12 @@ class LwdCloudModelRunnerMixin(GPUModelRunner):
                 f"{type(self.model_state).__name__}"
             )
         prompt_stage = getattr(self.worker, "_lwd_stager", None)
-        self.model_state.bind_lwd_prompt_stage(prompt_stage)
+        self.model_state.bind_lwd_prompt_stage(
+            prompt_stage,
+            self._lwd_request_connection,
+            getattr(self.worker, "_lwd_up_src_ranks", None),
+            getattr(self.worker, "rank", 0),
+        )
         self._install_lwd_penalties()
         self._install_lwd_model_wrapper()
 
@@ -77,8 +85,30 @@ class LwdCloudModelRunnerMixin(GPUModelRunner):
     def _install_lwd_model_wrapper(self) -> None:
         return
 
+    def _lwd_request_connection(self, req_id: str) -> LwdConnectionId:
+        stamped = getattr(self, "_lwd_request_connections", {}).get(req_id)
+        if stamped is not None:
+            return stamped
+        worker = getattr(self, "worker", None)
+        connections = getattr(worker, "_lwd_connections", ())
+        if not connections:
+            return LwdConnectionId(0, 0, 0)
+        edge_id, _ = parse_edge_id(req_id)
+        candidates = [
+            connection for connection in connections if connection.edge_id == edge_id
+        ]
+        if len(candidates) != 1:
+            raise RuntimeError(
+                f"[LWD] req={req_id} has no unique local connection for edge {edge_id}"
+            )
+        return candidates[0]
+
     def update_requests(self, scheduler_output: SchedulerOutput) -> None:
         super().update_requests(scheduler_output)
+        req_ids = [req.req_id for req in scheduler_output.scheduled_new_reqs]
+        req_ids.extend(scheduler_output.scheduled_cached_reqs.req_ids)
+        for req_id in req_ids:
+            self._lwd_request_connections[req_id] = self._lwd_request_connection(req_id)
         if self.worker is None:
             return
         view = LwdCloudBatchView(
@@ -114,6 +144,28 @@ class LwdCloudModelRunnerMixin(GPUModelRunner):
         )
         self.model_state.lwd_input_assembler.align_consumed(view)
 
+    def _lwd_collect_down_payloads(
+        self,
+        batch: LwdDownBatch,
+        input_batch: InputBatch,
+    ) -> list[LwdDownPayload]:
+        req_ids = list(input_batch.req_ids)
+        request_connections = {
+            req_id: self._lwd_request_connection(req_id) for req_id in req_ids
+        }
+        payloads = []
+        for connection in sorted(set(request_connections.values())):
+            connection_rows = batch.valid_rows & np.asarray(
+                [request_connections[req_id] == connection for req_id in req_ids],
+                dtype=np.bool_,
+            )
+            payload = self._lwd_down_builder.build(
+                batch._replace(valid_rows=connection_rows, connection=connection)
+            )
+            if payload is not None:
+                payloads.append(payload)
+        return payloads
+
     def sample(
         self,
         hidden_states: torch.Tensor,
@@ -124,7 +176,6 @@ class LwdCloudModelRunnerMixin(GPUModelRunner):
         if not wire_endpoint:
             return super().sample(hidden_states, input_batch, grammar_output)
         sample_hidden_states = hidden_states[input_batch.logits_indices]
-        req_ids = list(input_batch.req_ids)
         valid_rows = input_batch.idx_mapping_np >= 0
         num_draft = input_batch.num_draft_tokens_per_req
         if num_draft is not None:
@@ -134,29 +185,32 @@ class LwdCloudModelRunnerMixin(GPUModelRunner):
             hidden_states, input_batch, grammar_output
         )
         logits = self.model_state.take_lwd_sample_logits()
+        self._lwd_pending_down_payload = None
         if logits is not None:
             if logits.shape[0] != sample_hidden_states.shape[0]:
                 raise RuntimeError("[LWD] captured logits do not match sampled rows")
-            self._lwd_pending_down_payload = self._lwd_down_builder.build(
+            self._lwd_pending_down_payload = self._lwd_collect_down_payloads(
                 LwdDownBatch(
                     sample_hidden_states=sample_hidden_states,
                     logits=logits,
                     sampled_token_ids=sampler_output.sampled_token_ids,
-                    req_ids=req_ids,
+                    req_ids=list(input_batch.req_ids),
                     valid_rows=valid_rows,
                     num_draft_tokens_per_req=num_draft,
                     num_sampled_tokens=num_sampled,
-                )
+                ),
+                input_batch,
             )
         return sampler_output, num_sampled, num_rejected
 
-    def take_lwd_pending_down_payload(self) -> LwdDownPayload | None:
+    def take_lwd_pending_down_payload(self) -> list[LwdDownPayload] | None:
         payload = self._lwd_pending_down_payload
         self._lwd_pending_down_payload = None
         return payload
 
     def lwd_release_finished(self, finished_req_ids: list[str]) -> None:
         for req_id in finished_req_ids:
+            self._lwd_request_connections.pop(req_id, None)
             req_index = self.req_states.req_id_to_index.get(req_id)
             if req_index is not None:
                 self.model_state.next_prompt_embeds[req_index].zero_()
