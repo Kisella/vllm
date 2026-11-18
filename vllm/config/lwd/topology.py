@@ -200,6 +200,7 @@ class LwdCoordination:
     consumer_id: LwdString | None = None
     # Cloud-side fields
     listen_host: LwdString = "0.0.0.0"
+    probe_poll_budget: Annotated[int, Field(strict=True, gt=0)] = 32
     # Shared
     connect_timeout: Annotated[float, Field(strict=True, gt=0, allow_inf_nan=False)] = (
         10.0

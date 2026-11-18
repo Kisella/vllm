@@ -245,7 +245,9 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             )
 
             self._lwd_control_processor = LwdCloudControlProcessor(
-                self._lwd_coord_pending, self.cloud_control_event_queue
+                self._lwd_coord_pending,
+                self.cloud_control_event_queue,
+                poll_budget=coordination.probe_poll_budget,
             )
             threading.Thread(
                 target=self._lwd_coord_wake_loop,

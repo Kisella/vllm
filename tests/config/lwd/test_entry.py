@@ -313,6 +313,13 @@ def test_edge_coordination_still_requires_tenant_unless_placement_only() -> None
     LwdCoordinationConfig(enabled=True, placement_only=True).validate_role("edge")
 
 
+def test_probe_poll_budget_config_validation() -> None:
+    assert LwdCoordinationConfig().probe_poll_budget == 32
+    assert LwdCoordinationConfig(probe_poll_budget=2).probe_poll_budget == 2
+    with pytest.raises(ValueError):
+        LwdCoordinationConfig(probe_poll_budget=0)
+
+
 @pytest.mark.parametrize("field", ["control_url", "control_url_map", "listen_port"])
 def test_legacy_coordination_config_fields_are_rejected(field: str) -> None:
     value = "http://127.0.0.1:8100" if field == "control_url" else 8100
