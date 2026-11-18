@@ -18,9 +18,16 @@ from vllm.v1.worker.gpu.lwd.down_payload import (
     LwdDownPayload,
     LwdDownPayloadBuilder,
 )
-from vllm.v1.worker.gpu.lwd.model_state import LwdCloudModelStateMixin
+from vllm.v1.worker.gpu.lwd.model_state import (
+    LwdCloudModelState,
+    LwdCloudModelStateMixin,
+)
+from vllm.v1.worker.gpu.lwd.mtp_speculator import LwdCloudMTPSpeculator
 from vllm.v1.worker.gpu.lwd.penalties import LwdCloudPenaltiesState
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+from vllm.v1.worker.gpu.model_states import init_model_state
+from vllm.v1.worker.gpu.model_states.default import DefaultModelState
+from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 
 
@@ -53,6 +60,28 @@ class LwdCloudModelRunnerMixin(GPUModelRunner):
         self._lwd_pending_down_payload: list[LwdDownPayload] | None = None
         self._lwd_request_connections: dict[str, LwdConnectionId] = {}
         self._lwd_down_builder = LwdDownPayloadBuilder(self.device)
+
+    def create_speculator(self) -> Any:
+        assert self.speculative_config is not None
+        if self.speculative_config.method == "mtp":
+            return LwdCloudMTPSpeculator(self.vllm_config, self.device)
+        return super().create_speculator()
+
+    def lwd_model_state_overrides(self) -> dict[type[ModelState], type[ModelState]]:
+        return {DefaultModelState: LwdCloudModelState}
+
+    def create_model_state(self) -> ModelState:
+        if hasattr(self.model, "get_model_state_cls"):
+            return super().create_model_state()
+        native_cls = self.resolve_model_state_cls(self.model)
+        model_state_cls = self.lwd_model_state_overrides().get(native_cls, native_cls)
+        return init_model_state(
+            self.vllm_config,
+            self.model,
+            self.encoder_cache,
+            self.device,
+            model_state_cls=model_state_cls,
+        )
 
     def load_model(self, *args: Any, **kwargs: Any) -> None:
         super().load_model(*args, **kwargs)

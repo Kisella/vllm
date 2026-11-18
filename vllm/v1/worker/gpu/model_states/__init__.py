@@ -15,8 +15,9 @@ def init_model_state(
     model: nn.Module,
     encoder_cache: EncoderCache | None,
     device: torch.device,
+    model_state_cls: type[ModelState] | None = None,
 ) -> ModelState:
-    cls = resolve_model_state_cls(vllm_config, model)
+    cls = model_state_cls or resolve_model_state_cls(vllm_config, model)
 
     # Reject enable_prompt_embeds for states that would silently ignore it.
     if vllm_config.model_config.enable_prompt_embeds and not cls.supports_prompt_embeds:
@@ -53,12 +54,6 @@ def resolve_model_state_cls(
         from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
 
         return MambaHybridModelState
-
-    lwd_config = getattr(vllm_config, "lwd_config", None)
-    if lwd_config is not None and lwd_config.role == "cloud":
-        from vllm.v1.worker.gpu.lwd.model_state import LwdCloudModelState
-
-        return LwdCloudModelState
 
     from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 

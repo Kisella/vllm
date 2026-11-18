@@ -141,7 +141,11 @@ from vllm.v1.worker.gpu.lora_utils import (
 )
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.mm.lora import set_active_mm_loras
-from vllm.v1.worker.gpu.model_states import init_model_state
+from vllm.v1.worker.gpu.model_states import (
+    init_model_state,
+    resolve_model_state_cls,
+)
+from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.gpu.pool.pooling_runner import PoolingRunner
 from vllm.v1.worker.gpu.pp_utils import PPHandler
 from vllm.v1.worker.gpu.sample.batch_shard import (
@@ -299,9 +303,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.use_aux_hidden_state_outputs = False
         if self.speculative_config is not None:
             if self.is_last_pp_rank:
-                self.speculator = init_speculator(
-                    self.vllm_config, self.device, self.req_states
-                )
+                self.speculator = self.create_speculator()
 
             self.use_aux_hidden_state_outputs = requires_aux_hidden_states(
                 self.speculative_config
@@ -382,6 +384,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             tasks.extend(PoolingRunner.get_supported_tasks(self.model))
         return tuple(tasks)
 
+    def create_speculator(self) -> Any:
+        return init_speculator(self.vllm_config, self.device, self.req_states)
+
+    def resolve_model_state_cls(self, model: nn.Module) -> type[ModelState]:
+        return resolve_model_state_cls(self.vllm_config, model)
+
+    def create_model_state(self) -> ModelState:
+        return init_model_state(
+            self.vllm_config, self.model, self.encoder_cache, self.device
+        )
+
     def load_model(
         self,
         load_dummy_weights: bool = False,
@@ -435,9 +448,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
 
         # Initialize the components that require the model.
-        self.model_state = init_model_state(
-            self.vllm_config, self.model, self.encoder_cache, self.device
-        )
+        self.model_state = self.create_model_state()
 
         self.decode_query_len = (
             self.num_speculative_steps
