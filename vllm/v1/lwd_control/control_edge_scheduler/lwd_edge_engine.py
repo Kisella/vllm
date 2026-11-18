@@ -57,6 +57,7 @@ from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
     LwdRefillNotify,
     LwdRequestNotify,
     lwd_decode_cloud_to_edge,
+    lwd_encode_reasoning_parser_kwargs,
     lwd_encode_structured_outputs,
 )
 from vllm.v1.request import Request
@@ -416,6 +417,17 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         if values["max_tokens"] is None:
             values["max_tokens"] = LWD_SAMPLING_DEFAULTS["max_tokens"]
         values["stop_token_ids"] = list(values["stop_token_ids"] or [])
+        structured_req = request.structured_output_request
+        reasoning_ended = (
+            None if structured_req is None else structured_req.reasoning_ended
+        )
+        reasoning_parser_kwargs = (
+            ""
+            if structured_req is None
+            else lwd_encode_reasoning_parser_kwargs(
+                structured_req.reasoning_parser_kwargs
+            )
+        )
         self._lwd_send_to_cloud(
             dp_idx,
             LwdRequestNotify(
@@ -445,6 +457,8 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
                         sampling_params.structured_outputs
                     )
                 ),
+                reasoning_ended=reasoning_ended,
+                reasoning_parser_kwargs=reasoning_parser_kwargs,
                 **values,
             ),
         )

@@ -108,6 +108,14 @@ class LwdRequestNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[call
     `StructuredOutputsParams`; empty for a plain request. The cloud rebuilds
     the params, compiles the grammar and applies the sampling bitmask; the
     edge compiles its own copy only for the picker's grammar-ready filter."""
+    reasoning_ended: bool | None = None
+    """Initial reasoning-ended state computed by the edge frontend; the cloud
+    seeds its grammar gate from this instead of defaulting to thinking=True."""
+    reasoning_parser_kwargs: str = ""
+    """`json.dumps` of the request's `reasoning_parser_kwargs` (chat-template
+    kwargs incl. enable_thinking/thinking/reasoning_effort); empty when absent.
+    The cloud feeds this to `StructuredOutputManager._get_reasoner` so its
+    grammar gate matches the edge's prompt rendering."""
 
 
 def lwd_encode_structured_outputs(params: Any) -> str:
@@ -159,6 +167,16 @@ def lwd_decode_structured_outputs(payload: str, params_cls: type[T]) -> T | None
     # init=False private field: cannot ride the constructor, reattach here.
     cast(Any, params)._backend = backend
     return params
+
+
+def lwd_encode_reasoning_parser_kwargs(kwargs: dict[str, Any] | None) -> str:
+    """Wire JSON of a request's `reasoning_parser_kwargs`; empty when absent."""
+    return "" if kwargs is None else json.dumps(kwargs)
+
+
+def lwd_decode_reasoning_parser_kwargs(payload: str) -> dict[str, Any] | None:
+    """Rebuild `reasoning_parser_kwargs` from the wire JSON; None when absent."""
+    return None if not payload else json.loads(payload)
 
 
 LWD_SAMPLING_FIELDS: tuple[tuple[str, object], ...] = (

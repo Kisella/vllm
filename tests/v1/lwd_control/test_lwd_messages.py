@@ -20,8 +20,10 @@ from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
     LwdRequestNotify,
     lwd_decode_cloud_to_edge,
     lwd_decode_edge_to_cloud,
+    lwd_decode_reasoning_parser_kwargs,
     lwd_decode_structured_outputs,
     lwd_encode_message,
+    lwd_encode_reasoning_parser_kwargs,
     lwd_encode_structured_outputs,
 )
 
@@ -88,7 +90,7 @@ def _real_fields_from_source() -> dict[str, bool]:
 
 
 def test_request_notify_round_trips_full_prompt_mrope_positions() -> None:
-    assert LWD_MESSAGE_VERSION == 4
+    assert LWD_MESSAGE_VERSION == 5
     payload = bytes(range(24))
     decoded = lwd_decode_edge_to_cloud(
         lwd_encode_message(
@@ -121,6 +123,28 @@ def test_request_notify_round_trips_structured_outputs() -> None:
     )
     assert isinstance(decoded, LwdRequestNotify)
     assert decoded.structured_outputs == wire
+
+
+def test_request_notify_round_trips_reasoning_metadata() -> None:
+    kwargs = {"chat_template_kwargs": {"enable_thinking": False}}
+    decoded = lwd_decode_edge_to_cloud(
+        lwd_encode_message(
+            LwdRequestNotify(
+                request_id="r1",
+                num_prompt_tokens=1,
+                reasoning_ended=True,
+                reasoning_parser_kwargs=lwd_encode_reasoning_parser_kwargs(kwargs),
+            )
+        )
+    )
+    assert isinstance(decoded, LwdRequestNotify)
+    assert decoded.reasoning_ended is True
+    assert lwd_decode_reasoning_parser_kwargs(decoded.reasoning_parser_kwargs) == kwargs
+
+
+def test_reasoning_parser_kwargs_encode_decode_defaults() -> None:
+    assert lwd_encode_reasoning_parser_kwargs(None) == ""
+    assert lwd_decode_reasoning_parser_kwargs("") is None
 
 
 def test_prefix_messages_round_trip() -> None:
