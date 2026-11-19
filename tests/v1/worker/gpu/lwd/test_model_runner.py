@@ -20,6 +20,7 @@ from vllm.v1.worker.gpu.lwd.model_runner import (
 from vllm.v1.worker.gpu.lwd.model_state import LwdCloudModelState
 from vllm.v1.worker.gpu.lwd.mtp_speculator import LwdCloudMTPSpeculator
 from vllm.v1.worker.gpu.model_states.default import DefaultModelState
+from vllm.v1.worker.worker_base import WorkerBase
 
 
 class _EmbeddingModel(torch.nn.Module):
@@ -116,3 +117,21 @@ def test_lwd_runner_selects_lwd_mtp_speculator(tmp_path, distributed_runtime) ->
     runner = LwdCloudModelRunnerV2(config, torch.device("cpu"))
 
     assert isinstance(runner.speculator, LwdCloudMTPSpeculator)
+
+
+def test_lwd_runner_binds_prompt_stage_with_torch_global_rank(
+    tmp_path, distributed_runtime
+) -> None:
+    config = VllmConfig(model_config=_model_config(tmp_path))
+    runner = LwdCloudModelRunnerV2(config, torch.device("cpu"))
+    runner.model = _EmbeddingModel()
+    runner.worker = WorkerBase(
+        vllm_config=config,
+        local_rank=0,
+        rank=7,
+        distributed_init_method="",
+    )
+
+    runner.load_model(model=runner.model)
+
+    assert runner.model_state.lwd_input_assembler._local_rank == 0

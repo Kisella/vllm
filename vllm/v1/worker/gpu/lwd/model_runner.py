@@ -95,7 +95,7 @@ class LwdCloudModelRunnerMixin(GPUModelRunner):
             prompt_stage,
             self._lwd_request_connection,
             getattr(self.worker, "_lwd_up_src_ranks", None),
-            getattr(self.worker, "rank", 0),
+            get_tp_group().rank,
         )
         self._install_lwd_penalties()
         self._install_lwd_model_wrapper()
