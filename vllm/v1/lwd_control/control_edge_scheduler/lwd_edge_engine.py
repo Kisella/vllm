@@ -213,7 +213,10 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             return True
         if isinstance(msg, LwdC2eNotify):
             connection_id = self._lwd_connection_of(peer)
-            lwd_logger.info(
+            # One per decode step per engine on the control-plane IO thread,
+            # which shares the GIL with the only scheduling thread: debug,
+            # not info.
+            lwd_logger.debug(
                 "[edge] c2e received from %s reqs=%d hidden_numel=%d",
                 connection_id,
                 len(msg.req_ids),
@@ -428,6 +431,7 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
                 structured_req.reasoning_parser_kwargs
             )
         )
+        metadata = self.scheduler.lwd_model_family.request_metadata(request)
         self._lwd_send_to_cloud(
             dp_idx,
             LwdRequestNotify(
@@ -450,6 +454,7 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
                     request, "lwd_prefix_probe_succeeded", False
                 ),
                 mrope_positions=self.scheduler.lwd_mrope_positions(request.request_id),
+                image_placeholder_spans=metadata.image_placeholder_spans,
                 structured_outputs=(
                     ""
                     if sampling_params.structured_outputs is None
