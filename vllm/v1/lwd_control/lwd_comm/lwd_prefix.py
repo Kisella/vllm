@@ -40,9 +40,8 @@ HEADER_ALIGNMENT_TOKENS = "X-Edge-Cloud-Alignment-Tokens"
 HEADER_MM_ABI = "X-Edge-Cloud-MM-ABI"
 HEADER_CLOUD_ID = "X-Edge-Cloud-Cloud-Id"
 HEADER_PROMPT_TOKENS = "X-Edge-Cloud-Prompt-Tokens"
-# Cloud-local DP placement (the selected engine's dp_rank); zero preserves
-# compatibility with clouds that do not advertise this field.
 HEADER_ENGINE_INDEX = "X-Edge-Cloud-Engine-Index"
+HEADER_PROBE_NONCE = "X-Lwd-Probe-Nonce"
 
 _FULL_BLOCK_DOMAIN = b"\x01"
 _TAIL_BLOCK_DOMAIN = b"\x02"
@@ -428,9 +427,8 @@ class LwdProbeResult:
     # Cloud ID in the routing reply: filled by the central scheduler/gateway
     # for multi-cloud routing; None means one cloud or routing disabled.
     cloud_id: int | None = None
-    # Cloud-local DP placement: the engine index (dp_rank) holding the hit and
-    # reservation. Zero means single-engine or an older cloud that does not
-    # advertise placement; edge routing treats it as zero for compatibility.
+    # Cloud-local DP placement. The new direct-DP protocol always serializes
+    # this field, including zero.
     engine_index: int = 0
 
     def __post_init__(self) -> None:
@@ -454,11 +452,10 @@ class LwdProbeResult:
             HEADER_HIT_BLOCKS: str(self.hit_blocks),
             HEADER_HIT_TOKENS: str(self.hit_tokens),
             HEADER_ALIGNMENT_TOKENS: str(self.alignment_tokens),
+            HEADER_ENGINE_INDEX: str(self.engine_index),
         }
         if self.cloud_id is not None:
             headers[HEADER_CLOUD_ID] = str(self.cloud_id)
-        if self.engine_index:
-            headers[HEADER_ENGINE_INDEX] = str(self.engine_index)
         return headers
 
     def to_control_message(
@@ -478,11 +475,10 @@ class LwdProbeResult:
             "hit_blocks": self.hit_blocks,
             "hit_tokens": self.hit_tokens,
             "alignment_tokens": self.alignment_tokens,
+            "engine_index": self.engine_index,
         }
         if self.cloud_id is not None:
             message["cloud_id"] = self.cloud_id
-        if self.engine_index:
-            message["engine_index"] = self.engine_index
         if mm_abi is not None:
             message["mm_abi"] = mm_abi
         return message
@@ -499,11 +495,9 @@ class LwdProbeResult:
             if type(message.get(name)) is not int:
                 raise ValueError(f"probe {name} must be an integer")
         cloud_id = message.get("cloud_id")
-        if cloud_id is not None and type(cloud_id) is not int:
-            raise ValueError("probe cloud_id must be an integer or null")
-        # Older clouds do not advertise engine_index; default to zero (the
-        # single-engine meaning) for backward compatibility.
-        engine_index = message.get("engine_index", 0)
+        if type(cloud_id) is not int or cloud_id < 0:
+            raise ValueError("probe cloud_id must be a non-negative integer")
+        engine_index = message.get("engine_index")
         if type(engine_index) is not int or engine_index < 0:
             raise ValueError("probe engine_index must be a non-negative integer")
         alignment_tokens = message.get("alignment_tokens", 0)
@@ -533,9 +527,7 @@ class LwdProbeResult:
         if required(HEADER_PROTOCOL) != PROTOCOL_VERSION:
             raise ValueError("unsupported edge-cloud protocol")
         try:
-            cloud_id_raw = values.get(HEADER_CLOUD_ID.lower())
             alignment_raw = values.get(HEADER_ALIGNMENT_TOKENS.lower(), "0")
-            engine_index_raw = values.get(HEADER_ENGINE_INDEX.lower(), "0")
             return cls(
                 request_id=required(HEADER_REQUEST_ID),
                 instance_id=required(HEADER_INSTANCE_ID),
@@ -552,14 +544,11 @@ class LwdProbeResult:
                 alignment_tokens=_parse_ascii_decimal(
                     HEADER_ALIGNMENT_TOKENS, alignment_raw
                 ),
-                cloud_id=(
-                    _parse_ascii_decimal(HEADER_CLOUD_ID, cloud_id_raw)
-                    if cloud_id_raw is not None
-                    else None
+                cloud_id=_parse_ascii_decimal(
+                    HEADER_CLOUD_ID, required(HEADER_CLOUD_ID)
                 ),
-                # Older clouds omit engine placement; zero is single-engine.
                 engine_index=_parse_ascii_decimal(
-                    HEADER_ENGINE_INDEX, engine_index_raw
+                    HEADER_ENGINE_INDEX, required(HEADER_ENGINE_INDEX)
                 ),
             )
         except ValueError as exc:
