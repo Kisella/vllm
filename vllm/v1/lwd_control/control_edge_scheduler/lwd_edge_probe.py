@@ -24,11 +24,9 @@ from vllm.v1.lwd_control.control_edge_scheduler.lwd_probe_runtime import (
     LwdProbeRuntime,
 )
 from vllm.v1.lwd_control.lwd_comm.lwd_mm_identity import compute_processor_fingerprint
-from vllm.v1.lwd_control.lwd_comm.lwd_prefix import LwdProbeResult
+from vllm.v1.lwd_control.lwd_comm.lwd_prefix import PROBE_HEADROOM_S, LwdProbeResult
 
 logger = init_logger(__name__)
-
-_WATCHDOG_HEADROOM_S = 5.0
 
 
 class LwdProbeSubmission(Enum):
@@ -268,9 +266,7 @@ class LwdEdgeProbeManager:
             if not future.done():
                 future.cancel()
 
-        timer = threading.Timer(
-            coordination.probe_timeout + _WATCHDOG_HEADROOM_S, watchdog
-        )
+        timer = threading.Timer(coordination.probe_timeout + PROBE_HEADROOM_S, watchdog)
         timer.daemon = True
 
         def done(future: Any) -> None:
