@@ -1793,11 +1793,14 @@ def init_distributed_environment(
 
     config = get_current_vllm_config_or_none()
     enable_elastic_ep = config is not None and config.parallel_config.enable_elastic_ep
-    if config is not None and config.lwd_config is not None:
-        if not config.lwd_config.topology.is_host_comm:
-            world_size, rank, distributed_init_method = _lwd_world_args(config, rank)
-        # Host comm: keep the native world args computed above (the edge
-        # and cloud are separate launches with no shared LWD world).
+    if (
+        config is not None
+        and config.lwd_config is not None
+        and not config.lwd_config.topology.is_host_comm
+    ):
+        # Device comm: the topology supplies every side's global rank and the
+        # shared world size, so the caller's per-instance args are replaced.
+        world_size, rank, distributed_init_method = _lwd_world_args(config, rank)
     elif (
         config is not None
         and config.parallel_config.distributed_executor_backend != "external_launcher"
@@ -1808,6 +1811,12 @@ def init_distributed_environment(
         and not enable_elastic_ep
     ):
         parallel_config = config.parallel_config
+        # Native path, shared with LWD host comm: the sides are separate
+        # launches with no cross-side world, but a multi-DP instance still
+        # folds DP into its own world exactly like a plain deployment (the
+        # LWD DP engine keeps data_parallel_size > 1, so the model parallel
+        # groups must see the DP-wide world or the reshape below in
+        # initialize_model_parallel cannot divide it).
         # adjust to take into account data parallelism
         # offset the rank by the data parallel rank
         rank = parallel_config.data_parallel_rank * world_size + rank
