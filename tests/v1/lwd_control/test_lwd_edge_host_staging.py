@@ -19,6 +19,7 @@ from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
     LwdAbortNotify,
     LwdRequestNotify,
 )
+from vllm.v1.lwd_control.lwd_model.lwd_model_family import LwdMropeModelFamily
 
 DP0 = LwdConnectionId(0, 0, 0)
 DP1 = LwdConnectionId(0, 0, 1)
@@ -32,7 +33,8 @@ def _scheduler() -> LwdEdgeScheduler:
     }
     scheduler._lwd_aborted_req_ids = {DP0: [], DP1: []}
     scheduler._lwd_route = {}
-    scheduler._lwd_mrope_positions_dict = {}
+    scheduler.lwd_model_family = object.__new__(LwdMropeModelFamily)
+    scheduler.lwd_model_family._positions = {}
     scheduler._lwd_pending_refills = ()
     scheduler.lwd_has_pending = None
     scheduler.unembed_notify_queue = ()
@@ -137,7 +139,7 @@ def test_range_leaves_mrope_bytes_empty_and_full_prompt_is_read_only() -> None:
             return b"full-prompt"
 
     scheduler = _scheduler()
-    scheduler._lwd_mrope_positions_dict["r1"] = Positions()
+    scheduler.lwd_model_family._positions["r1"] = Positions()
     scheduler.requests["r1"] = SimpleNamespace(
         num_computed_tokens=5,
         prompt_token_ids=[0, 1, 2, 3, 4],
