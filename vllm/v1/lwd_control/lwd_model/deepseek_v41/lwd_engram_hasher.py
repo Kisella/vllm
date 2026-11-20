@@ -68,6 +68,7 @@ class LwdEngramHasher:
         Raises:
             ValueError: The tokenizer's compressed vocab size differs from the
                 config, or the config has no `image_token_id`.
+
         """
         hf_config = get_config(
             model_config.hf_config_path or model_config.model,
@@ -138,6 +139,7 @@ class LwdEngramHasher:
 
         Raises:
             ValueError: The range is outside the prompt.
+
         """
         if not 0 <= start <= end <= prompt_token_ids.numel():
             raise ValueError(
