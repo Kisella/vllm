@@ -1,11 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
-from vllm.config.lwd import LwdConnectionId, LwdTopology
-from vllm.distributed.lwd import LwdChannelEndpoints, LwdParallelGroupsSpec
+from vllm.config.lwd import LwdConfig, LwdConnectionId, LwdTopology
+from vllm.distributed.lwd import (
+    LwdChannelEndpoints,
+    LwdParallelGroupsSpec,
+    lwd_check_parallel_config,
+)
+from vllm.v1.lwd_control.lwd_comm.lwd_control_plane_factory import _lwd_validate_dp
 
 
 def _instance(
@@ -206,3 +212,120 @@ def test_rank_outside_the_world_has_no_tp_group() -> None:
 
     with pytest.raises(ValueError, match="not in"):
         spec.tp_group_of(2)
+
+
+def _host_config(
+    role: str,
+    tensor_parallel_size: int,
+    *,
+    dp_count: int = 1,
+    dp_size: int = 1,
+) -> Any:
+    """Host layout of one edge and one cloud, no ranks, the cloud listens."""
+    topology = LwdTopology.from_dict(
+        {
+            "deployment": {
+                "mode": 0,
+                "scene": "single_instance",
+                "edges_num": 1,
+                "clouds_num": 1,
+                "data_plane_comm": "host",
+            },
+            "feature_ctrl": {"enable_early_recv": False},
+            "edges": [
+                {
+                    "id": 0,
+                    "dp": [
+                        {"dp_idx": index, "addr": "10.0.0.1"}
+                        for index in range(dp_count)
+                    ],
+                }
+            ],
+            "clouds": [
+                {
+                    "id": 0,
+                    "dp": [
+                        {
+                            "dp_idx": index,
+                            "addr": "10.1.0.1",
+                            "ctrl_port": 5550 + index,
+                            "data_port": 7000 + index,
+                        }
+                        for index in range(dp_count)
+                    ],
+                }
+            ],
+            "instance_links": [{"edge": 0, "cloud": 0}],
+        }
+    )
+    return SimpleNamespace(
+        lwd_config=LwdConfig.from_topology("host_topology.yaml", role, 0, topology),
+        parallel_config=SimpleNamespace(
+            pipeline_parallel_size=1,
+            prefill_context_parallel_size=1,
+            decode_context_parallel_size=1,
+            enable_elastic_ep=False,
+            data_parallel_size=dp_size,
+            tensor_parallel_size=tensor_parallel_size,
+        ),
+        engram_config=None,
+    )
+
+
+def _device_config(role: str, *, dp_count: int, dp_size: int) -> Any:
+    """Device layout of one edge and one cloud: shared world, per-DP ranks."""
+    topology = _topology(
+        "single_instance",
+        [_instance(0, [[0]] * dp_count, cloud=False)],
+        [_instance(0, [[index + 1] for index in range(dp_count)], cloud=True)],
+        [(0, 0)],
+    )
+    return SimpleNamespace(
+        lwd_config=LwdConfig.from_topology("device_topology.yaml", role, 0, topology),
+        parallel_config=SimpleNamespace(
+            pipeline_parallel_size=1,
+            prefill_context_parallel_size=1,
+            decode_context_parallel_size=1,
+            enable_elastic_ep=False,
+            data_parallel_size=dp_size,
+            tensor_parallel_size=1,
+        ),
+        engram_config=None,
+    )
+
+
+def test_multi_dp_config_check_leaves_the_dp_layout_to_the_engine() -> None:
+    """The config object must not enforce the DP layout.
+
+    vLLM rebuilds derived configs after an independent non-MoE DP engine reset
+    `data_parallel_size` to 1 (e.g. the MTP draft config), so a check on this
+    object would reject a valid 2-DP launch. The role rule is enforced where
+    the launch value still exists: the engine dispatch and the control plane.
+    """
+    lwd_check_parallel_config(_host_config("edge", 1, dp_count=2, dp_size=1))
+    lwd_check_parallel_config(_host_config("cloud", 1, dp_count=2, dp_size=1))
+    lwd_check_parallel_config(_device_config("edge", dp_count=2, dp_size=1))
+    lwd_check_parallel_config(_device_config("cloud", dp_count=2, dp_size=1))
+
+
+@pytest.mark.parametrize("host_comm", [True, False])
+def test_control_plane_dp_rule_follows_the_role(host_comm: bool) -> None:
+    """One rule for both data planes: edge=1, cloud=len(dp).
+
+    The control plane receives the launch DP size, so it is the place that
+    rejects an edge or cloud started with the wrong DP size regardless of the
+    transport.
+    """
+    if host_comm:
+        edge = _host_config("edge", 1, dp_count=2, dp_size=1).lwd_config
+        cloud = _host_config("cloud", 1, dp_count=2, dp_size=1).lwd_config
+    else:
+        edge = _device_config("edge", dp_count=2, dp_size=1).lwd_config
+        cloud = _device_config("cloud", dp_count=2, dp_size=1).lwd_config
+
+    _lwd_validate_dp(edge, dp_rank=0, dp_size=1)
+    _lwd_validate_dp(cloud, dp_rank=1, dp_size=2)
+    with pytest.raises(ValueError, match="data parallel size 1"):
+        _lwd_validate_dp(edge, dp_rank=0, dp_size=2)
+    with pytest.raises(ValueError, match="data parallel size 1"):
+        _lwd_validate_dp(cloud, dp_rank=0, dp_size=1)
