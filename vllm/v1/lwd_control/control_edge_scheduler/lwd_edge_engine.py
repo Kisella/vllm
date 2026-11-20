@@ -484,6 +484,7 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
                 structured_req.reasoning_parser_kwargs
             )
         )
+        metadata = self.scheduler.lwd_model_family.request_metadata(request)
         self._lwd_send_to_cloud(
             dp_idx,
             LwdRequestNotify(
@@ -506,6 +507,7 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
                     request, "lwd_prefix_probe_succeeded", False
                 ),
                 mrope_positions=self.scheduler.lwd_mrope_positions(request.request_id),
+                image_placeholder_spans=metadata.image_placeholder_spans,
                 structured_outputs=(
                     ""
                     if sampling_params.structured_outputs is None
