@@ -39,6 +39,8 @@ def _validate_lwd_v2_config(vllm_config: VllmConfig) -> None:
         or speculative_config.use_multi_module_mtp()
     ):
         raise ValueError("[LWD] MRV2 currently supports only standard MTP speculation")
+    if getattr(vllm_config.model_config.hf_text_config, "engram_layer_ids", None):
+        raise ValueError("[LWD] MRV2 DeepSeek V4.1 Engram support is pending; use MRV1")
     parallel_config = vllm_config.parallel_config
     if parallel_config.enable_batch_sharded_sampling:
         raise ValueError("[LWD] MRV2 does not support batch-sharded sampling")
