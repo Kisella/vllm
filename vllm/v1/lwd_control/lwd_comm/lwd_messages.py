@@ -260,6 +260,8 @@ class LwdPrefixReadyNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[
     hit_tokens: int
     nonce: int
     error: str = ""
+    replay_start: int = -1
+    """First prompt row the edge must send for bounded replay; -1 when absent."""
 
 
 class LwdRefillNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[call-arg]

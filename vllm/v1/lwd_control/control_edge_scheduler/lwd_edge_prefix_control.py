@@ -118,11 +118,20 @@ class LwdEdgePrefixControl:
             )
             self._rollback_and_abort(request)
             return True
-        if self._engine.scheduler.lwd_edge_prefix_ready(request, reply.hit_tokens):
+        if reply.replay_start < 0:
+            accepted = self._engine.scheduler.lwd_edge_prefix_ready(
+                request, reply.hit_tokens
+            )
+        else:
+            accepted = self._engine.scheduler.lwd_edge_prefix_ready(
+                request, reply.hit_tokens, reply.replay_start
+            )
+        if accepted:
             lwd_logger.info(
-                "[prefix] READY req=%s hit_tokens=%d",
+                "[prefix] READY req=%s hit_tokens=%d replay_start=%d",
                 reply.request_id,
                 reply.hit_tokens,
+                reply.replay_start,
             )
             self._engine._lwd_enqueue_request(request)
         else:

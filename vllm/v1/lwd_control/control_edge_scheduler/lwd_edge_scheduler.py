@@ -776,20 +776,26 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             request.request_id, self._lwd_edge_id_of(request), preferred
         )
 
-    def lwd_edge_prefix_ready(self, request: Request, hit_tokens: int) -> bool:
+    def lwd_edge_prefix_ready(
+        self, request: Request, hit_tokens: int, replay_start: int = -1
+    ) -> bool:
         hash_block_size = self._lwd_prefix_hash_block_size
-        valid = 0 <= hit_tokens < request.num_prompt_tokens and (
+        start = hit_tokens if replay_start < 0 else replay_start
+        valid = 0 <= start <= hit_tokens < request.num_prompt_tokens and (
             hash_block_size <= 0 or hit_tokens % hash_block_size == 0
         )
         if not valid:
             lwd_logger.error(
-                "[prefix] invalid READY hit req=%s hit=%d",
+                "[prefix] invalid READY hit req=%s hit=%d replay_start=%d",
                 request.request_id,
                 hit_tokens,
+                replay_start,
             )
             request.num_computed_tokens = 0
             return False
-        request.num_computed_tokens = hit_tokens
+        request.num_computed_tokens = start
+        if 0 <= replay_start < hit_tokens:
+            request.replay_start = replay_start
         return True
 
     def lwd_edge_cancel_admission(self, request_id: str) -> None:
