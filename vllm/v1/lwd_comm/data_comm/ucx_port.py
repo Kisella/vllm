@@ -406,6 +406,11 @@ class LwdUcxDaemonPort:
             "hs_timeout_s": cfg.hs_timeout_s,
             "early_max": cfg.early_max,
             "pool_staging": cfg.pool_staging,
+            # QoS travels with the attach: the daemon owns the channel, so it
+            # must inject IB_TRAFFIC_CLASS/IB_SL and mark the handshake TOS
+            # itself. Optional keys: an older daemon simply ignores them.
+            "traffic_class": cfg.traffic_class,
+            "sl": cfg.sl,
         }
         reply, fds = self._ctl_roundtrip(req)
         if not reply.get("ok") or len(fds) != 3:
@@ -603,7 +608,7 @@ class LwdUcxDaemonPort:
             self._wake_daemon()
 
     def _dispatch_loop(self) -> None:
-        """cpl dispatch + recv block recycling (single dispatcher thread,
+        """Cpl dispatch + recv block recycling (single dispatcher thread,
         cpl FIFO order preserved)."""
         while not self._stopped:
             ready, _, _ = select.select([self._wake_engine_r], [], [], 0.05)
