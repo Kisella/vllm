@@ -316,6 +316,10 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
                 self._has_fault = has_fault.to("cpu", non_blocking=True)
             self.async_copy_ready_event.record()
 
+    @property
+    def model_runner_output(self) -> ModelRunnerOutput:
+        return self._model_runner_output
+
     def get_output(self) -> ModelRunnerOutput:
         """Copy the device tensors to the host and return a ModelRunnerOutput.
 
@@ -441,6 +445,10 @@ class AsyncGPUPoolingModelRunnerOutput(AsyncModelRunnerOutput):
                 finished_mask=finished_mask,
             )
             self.async_copy_ready_event.record()
+
+    @property
+    def model_runner_output(self) -> ModelRunnerOutput:
+        return self._model_runner_output
 
     def get_output(self) -> ModelRunnerOutput:
         """Copy the device tensors to the host and return a ModelRunnerOutput.
