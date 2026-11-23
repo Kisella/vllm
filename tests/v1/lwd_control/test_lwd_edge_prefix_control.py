@@ -301,6 +301,21 @@ def test_invalid_ready_hit_is_rejected_without_raising() -> None:
     assert request.num_computed_tokens == 8
 
 
+def test_replay_start_controls_initial_prompt_offset() -> None:
+    scheduler = object.__new__(LwdEdgeScheduler)
+    scheduler._lwd_prefix_hash_block_size = 4
+    request = _request()
+
+    assert scheduler.lwd_edge_prefix_ready(request, 8, 4)
+    assert request.num_computed_tokens == 4
+    assert request.replay_start == 4
+
+    legacy_request = _request()
+    assert scheduler.lwd_edge_prefix_ready(legacy_request, 8)
+    assert legacy_request.num_computed_tokens == 8
+    assert getattr(legacy_request, "replay_start", 0) == 0
+
+
 def _engine_request(request_id: str = "r") -> SimpleNamespace:
     return SimpleNamespace(
         request_id=request_id,

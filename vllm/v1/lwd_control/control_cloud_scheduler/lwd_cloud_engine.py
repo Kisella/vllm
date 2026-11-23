@@ -329,20 +329,39 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             time.sleep(_LWD_SEND_RETRY_SLEEP_S)
         _lwd_log_sent_to_edge(peer, message)
 
+    def _lwd_prefix_replay_start(self, request: Request, hit_tokens: int) -> int:
+        connector = self.scheduler.connector
+        if hit_tokens <= 0 or (
+            connector is not None
+            and self.scheduler._load_restores_replay_window(request)
+        ):
+            return hit_tokens
+        replay_tokens = getattr(self.scheduler, "prefix_replay_tokens", 0)
+        return hit_tokens - min(hit_tokens, replay_tokens)
+
     def _lwd_send_prefix_ready(
         self, request_id: str, hit_tokens: int, nonce: int, error: str = ""
     ) -> None:
         peer = self._lwd_ledger.request_routes.get(request_id)
         if peer is None:
             raise RuntimeError(f"[LWD] prefix reply route missing for {request_id}")
+        request = self.scheduler.requests.get(request_id)
+        replay_start = (
+            self._lwd_prefix_replay_start(request, hit_tokens)
+            if request is not None
+            else hit_tokens
+        )
         self._lwd_send_until_queued(
             peer,
-            LwdPrefixReadyNotify(unwrap_req_id(request_id), hit_tokens, nonce, error),
+            LwdPrefixReadyNotify(
+                unwrap_req_id(request_id), hit_tokens, nonce, error, replay_start
+            ),
         )
         lwd_logger.info(
-            "[LWD][prefix] READY req=%s hit=%d nonce=%d error=%r",
+            "[LWD][prefix] READY req=%s hit=%d replay_start=%d nonce=%d error=%r",
             request_id,
             hit_tokens,
+            replay_start,
             nonce,
             error,
         )
