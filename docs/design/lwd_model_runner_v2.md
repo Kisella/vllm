@@ -232,3 +232,13 @@ MTP 复用公共 speculator 流程，Ascend 只覆写模型加载和图管理。
 - 本文档与两仓模块地图。
 
 临时诊断及其 revert、非 LWD 的 QSA/社区修复不纳入本次迁移。
+
+## 12. DSV4.1 Engram 后续适配点
+
+当前仅完成 MRV1。MRV2 在配置校验中明确拒绝 DSV4.1 Engram，避免模型专用 `EngramModelState` 绕过 LWD state 后静默使用占位 token ids。后续适配保持 MRV1 的边侧 hash 与 UP 数据契约，不回传完整 prompt token ids：
+
+- ModelState 工厂需要对模型自定义 state 也应用 LWD override，新增 `LwdAscendCloudModelState` 与 `EngramModelState` 的组合 state，保留远端 embedding 注入和原生 Engram 图执行。
+- `LwdAscendCloudInputAssembler` 复用 `LwdUpPayloadLayout` 和 `LwdEngramInputs`，按 chunk 写入外部 hashes、图像 spans 与 prompt tail records。
+- 组合 state 在 `prepare_engram_inputs()` 中替换原生 lookback window，并附加 `external_hashes/external_rows`；target forward 与 Engram dead mask 共用同一份重建 input ids。
+- eager、PIECEWISE、FULL 均需覆盖。FULL replay 只能读取持久 device buffer，不能复用上一真实 batch 的 row mask 或 hashes。
+- prefix/refill/preemption/abort/draft rollback 沿用 MRV1 生命周期语义；DSpark 另需审查 anchor、`next_prefill_tokens` 与 draft KV，不因 Engram 接入自动视为支持。
