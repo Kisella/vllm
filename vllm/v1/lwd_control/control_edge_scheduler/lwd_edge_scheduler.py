@@ -655,11 +655,11 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         num_new_tokens: int,
         encoder_compute_budget: int,
         shift_computed_tokens: int = 0,
-    ) -> tuple[list[int], int, int, list[int]]:
+    ) -> tuple[list[int], int, int, list[int], list[int]]:
         """Edge-side passthrough: encoder execution and caching are managed
         by the worker itself; native rollback would break the chunk
         contract, so nothing is scheduled, consumed, or rolled back."""
-        return [], num_new_tokens, encoder_compute_budget, []
+        return [], num_new_tokens, encoder_compute_budget, [], []
 
     def _lwd_has_prefill_chunk_inflight(self, dp_idx: LwdConnectionId) -> bool:
         """Whether dp_idx has an embed request not fully sent; same
