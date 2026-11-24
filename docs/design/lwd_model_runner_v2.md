@@ -82,7 +82,7 @@ flowchart TD
 
 ### 4.2 启动校验
 
-V2 在加载前拒绝非标准 MTP、DSpark adaptive verification、batch-sharded sampling、PCP/DCP>1 和 DBO；DSpark 当前也仅允许 `cudagraph_mode=NONE`。模型专用 state 先参与原生类型解析，再应用对应 LWD override；当前已组合通用 dense、通用 Mamba hybrid 和 DSV4.1 Engram state，未适配的专用 state 不因 LWD 被静默替换。
+V2 在加载前拒绝非标准 MTP、DSpark adaptive verification、batch-sharded sampling、PCP/DCP>1 和 DBO。模型专用 state 先参与原生类型解析，再应用对应 LWD override；当前已组合通用 dense、通用 Mamba hybrid 和 DSV4.1 Engram state，未适配的专用 state 不因 LWD 被静默替换。
 
 开启方式沿用现有 MRV2 开关，不新增 LWD 环境变量。运行时必须保证 engine 与所有 worker 使用同一套代码和同一开关。
 
@@ -178,7 +178,7 @@ worker 对每个 payload：
 
 MTP 复用公共 speculator 流程，Ascend 只覆写模型加载和图管理。prefill draft 输入按 target query window 右移；非最终 chunk 的最后一行使用 §6.3 的真实下一行 embedding，不能使用零占位。
 
-DSpark eager 直接使用原生 `AscendDSparkSpeculator`，anchor、target hidden 和 draft KV 均保持原生流程。中间 prefill chunk 的 draft token 会被调度器明确忽略，因此 `next_prefill_tokens` 的零占位可以沿用，不做 embedding 反查，也不额外屏蔽任何请求的 draft。
+DSpark 直接使用原生 `AscendDSparkSpeculator`，anchor、target hidden 和 draft KV 均保持原生流程。中间 prefill chunk 的 draft token 会被调度器明确忽略，因此 `next_prefill_tokens` 的零占位可以沿用，不做 embedding 反查，也不额外屏蔽任何请求的 draft。
 
 云端 prompt ids 是长度占位而非真实历史：
 
@@ -237,7 +237,7 @@ DSpark eager 直接使用原生 `AscendDSparkSpeculator`，anchor、target hidde
 
 ## 12. DSV4.1 Engram 分阶段适配
 
-MRV2 按“基础 eager、DSpark eager、PIECEWISE、FULL”分阶段适配，保持 MRV1 的边侧 hash 与 UP 数据契约，不回传完整 prompt token ids。前两个阶段代码已落地，但尚未完成 NPU 真机验证，当前只允许 `cudagraph_mode=NONE`；DSpark adaptive verification、PIECEWISE 和 FULL 继续 fail-fast。
+MRV2 按“基础 eager、DSpark eager、PIECEWISE、FULL”分阶段适配，保持 MRV1 的边侧 hash 与 UP 数据契约，不回传完整 prompt token ids。前三个阶段代码已落地，但尚未完成 NPU 真机验证；仅 DSpark adaptive verification 继续 fail-fast。
 
 第一阶段实现：
 
@@ -252,7 +252,13 @@ MRV2 按“基础 eager、DSpark eager、PIECEWISE、FULL”分阶段适配，�
 - 中间 prefill chunk 的 draft token 被原生调度器忽略，零占位 `next_prefill_tokens` 不参与后续输出，因此不做 embedding 反查或请求级 draft 屏蔽。
 - draft rollback 继续由原生 `num_rejected` 与 Engram 的 device-position lookback 处理，不新增 KV 或 token-id 回传协议。
 
-后续阶段：
+第三阶段实现：
 
-- PIECEWISE、FULL 均需覆盖。FULL replay 只能读取持久 device buffer，不能复用上一真实 batch 的 row mask 或 hashes；图内 producer 还需贯通 `external_hashes/external_rows`。
+- 组合 state 复用原生 Engram 的 PIECEWISE/FULL 准备流程，再覆盖重建 input ids、lookback 和 `external_hashes/external_rows`；DSpark 继续使用原生 speculator。
+- FULL 图内 producer 通过 `captured_engram_inputs()` 接收并传递外部 hashes，图外 producer 沿用延迟 `prepare_engram()`，两种路径读取同一份持久 device buffer。
+- Engram 外部 buffer 容量同时覆盖调度 token 上限和 FULL capture 上限，padding 行的 ids 与 external row mask 每步重写，不复用上一批状态。
+
+后续验证：
+
+- eager、PIECEWISE、FULL 均需覆盖，连续不同 batch replay 不得复用上一真实 batch 的 row mask 或 hashes。
 - prefix/refill/preemption/abort/draft rollback 沿用 MRV1 生命周期语义，并在各阶段与集中式、MRV1 做精度对照。

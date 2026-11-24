@@ -109,13 +109,12 @@ def test_lwd_v2_engram_allows_eager(tmp_path) -> None:
 
 
 @pytest.mark.parametrize("mode", [CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL])
-def test_lwd_v2_engram_rejects_cudagraphs(tmp_path, mode: CUDAGraphMode) -> None:
+def test_lwd_v2_engram_allows_cudagraphs(tmp_path, mode: CUDAGraphMode) -> None:
     config = VllmConfig(model_config=_model_config(tmp_path))
     config.model_config.hf_text_config.engram_layer_ids = [1]
     config.compilation_config.cudagraph_mode = mode
 
-    with pytest.raises(ValueError, match="cudagraph_mode=NONE"):
-        _validate_lwd_v2_config(config)
+    _validate_lwd_v2_config(config)
 
 
 def test_lwd_v2_allows_eager_dspark(tmp_path) -> None:
@@ -125,14 +124,11 @@ def test_lwd_v2_allows_eager_dspark(tmp_path) -> None:
     _validate_lwd_v2_config(config)
 
 
-def test_lwd_v2_dspark_rejects_cudagraphs(tmp_path) -> None:
+def test_lwd_v2_dspark_allows_cudagraphs(tmp_path) -> None:
     config = _dspark_config(tmp_path)
     config.compilation_config.cudagraph_mode = CUDAGraphMode.FULL
 
-    with pytest.raises(
-        ValueError, match="DSpark currently requires cudagraph_mode=NONE"
-    ):
-        _validate_lwd_v2_config(config)
+    _validate_lwd_v2_config(config)
 
 
 def test_lwd_v2_rejects_dspark_adaptive_verification(tmp_path) -> None:

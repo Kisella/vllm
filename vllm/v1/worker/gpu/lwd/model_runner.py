@@ -7,7 +7,6 @@ import numpy as np
 import torch
 
 from vllm.config import VllmConfig
-from vllm.config.compilation import CUDAGraphMode
 from vllm.config.lwd import LwdConnectionId
 from vllm.distributed.parallel_state import get_tp_group
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -40,23 +39,12 @@ def _validate_lwd_v2_config(vllm_config: VllmConfig) -> None:
             or speculative_config.use_step3p5_mtp()
             or speculative_config.use_multi_module_mtp()
         ):
-            raise ValueError(
-                "[LWD] MRV2 currently supports standard MTP and eager DSpark"
-            )
-        if speculative_config.use_dspark():
-            if speculative_config.enable_adaptive_verification:
-                raise ValueError("[LWD] MRV2 DSpark adaptive verification is deferred")
-            if vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
-                raise ValueError(
-                    "[LWD] MRV2 DSpark currently requires cudagraph_mode=NONE"
-                )
-    if (
-        getattr(vllm_config.model_config.hf_text_config, "engram_layer_ids", None)
-        and vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
-    ):
-        raise ValueError(
-            "[LWD] MRV2 DeepSeek V4.1 Engram currently requires cudagraph_mode=NONE"
-        )
+            raise ValueError("[LWD] MRV2 currently supports standard MTP and DSpark")
+        if (
+            speculative_config.use_dspark()
+            and speculative_config.enable_adaptive_verification
+        ):
+            raise ValueError("[LWD] MRV2 DSpark adaptive verification is deferred")
     parallel_config = vllm_config.parallel_config
     if parallel_config.enable_batch_sharded_sampling:
         raise ValueError("[LWD] MRV2 does not support batch-sharded sampling")
