@@ -34,12 +34,22 @@ from vllm.v1.worker.gpu.sample.output import SamplerOutput
 
 def _validate_lwd_v2_config(vllm_config: VllmConfig) -> None:
     speculative_config = vllm_config.speculative_config
-    if speculative_config is not None and (
-        speculative_config.method != "mtp"
-        or speculative_config.use_step3p5_mtp()
-        or speculative_config.use_multi_module_mtp()
-    ):
-        raise ValueError("[LWD] MRV2 currently supports only standard MTP speculation")
+    if speculative_config is not None:
+        if (
+            speculative_config.method not in ("mtp", "dspark")
+            or speculative_config.use_step3p5_mtp()
+            or speculative_config.use_multi_module_mtp()
+        ):
+            raise ValueError(
+                "[LWD] MRV2 currently supports standard MTP and eager DSpark"
+            )
+        if speculative_config.use_dspark():
+            if speculative_config.enable_adaptive_verification:
+                raise ValueError("[LWD] MRV2 DSpark adaptive verification is deferred")
+            if vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
+                raise ValueError(
+                    "[LWD] MRV2 DSpark currently requires cudagraph_mode=NONE"
+                )
     if (
         getattr(vllm_config.model_config.hf_text_config, "engram_layer_ids", None)
         and vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE

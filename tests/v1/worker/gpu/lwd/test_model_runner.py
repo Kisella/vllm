@@ -55,6 +55,21 @@ def _model_config(tmp_path, model_type: str = "qwen3") -> ModelConfig:
     return ModelConfig(model=str(tmp_path), enable_prompt_embeds=True, max_model_len=16)
 
 
+def _dspark_config(tmp_path) -> VllmConfig:
+    speculative_config = SpeculativeConfig(
+        method="draft_model",
+        target_model_config=_model_config(tmp_path),
+        target_parallel_config=ParallelConfig(),
+        model=str(tmp_path),
+        num_speculative_tokens=2,
+    )
+    speculative_config.method = "dspark"
+    return VllmConfig(
+        model_config=_model_config(tmp_path),
+        speculative_config=speculative_config,
+    )
+
+
 @pytest.fixture
 def distributed_runtime(monkeypatch):
     monkeypatch.setenv("RANK", "0")
@@ -100,6 +115,31 @@ def test_lwd_v2_engram_rejects_cudagraphs(tmp_path, mode: CUDAGraphMode) -> None
     config.compilation_config.cudagraph_mode = mode
 
     with pytest.raises(ValueError, match="cudagraph_mode=NONE"):
+        _validate_lwd_v2_config(config)
+
+
+def test_lwd_v2_allows_eager_dspark(tmp_path) -> None:
+    config = _dspark_config(tmp_path)
+    config.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+
+    _validate_lwd_v2_config(config)
+
+
+def test_lwd_v2_dspark_rejects_cudagraphs(tmp_path) -> None:
+    config = _dspark_config(tmp_path)
+    config.compilation_config.cudagraph_mode = CUDAGraphMode.FULL
+
+    with pytest.raises(
+        ValueError, match="DSpark currently requires cudagraph_mode=NONE"
+    ):
+        _validate_lwd_v2_config(config)
+
+
+def test_lwd_v2_rejects_dspark_adaptive_verification(tmp_path) -> None:
+    config = _dspark_config(tmp_path)
+    config.speculative_config.enable_adaptive_verification = True
+
+    with pytest.raises(ValueError, match="adaptive verification is deferred"):
         _validate_lwd_v2_config(config)
 
 

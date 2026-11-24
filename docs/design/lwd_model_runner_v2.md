@@ -20,7 +20,7 @@ LWD 在同一发布物中按既有 `VLLM_USE_V2_MODEL_RUNNER` / `use_v2_model_ru
 本期不做：
 
 - 历史上移之外的新重构。V1 历史模块仅在复用边端执行逻辑、统一 worker 契约等必要位置调整，不把全部历史模块搬到上游。
-- PCP/DCP、DBO、batch-sharded sampling、非标准 MTP 投机路径。相关配置先 fail-fast，后续按需求单独设计；PCP/DCP 是暂缓而非永久排除。
+- PCP/DCP、DBO、batch-sharded sampling、非标准 MTP 与 DSpark adaptive verification。相关配置先 fail-fast，后续按需求单独设计；PCP/DCP 是暂缓而非永久排除。
 - structured output 的重新实现。新主线已经通过请求消息、云侧 grammar 初始化和边侧 grammar-ready 过滤恢复该能力，见 `lwd_structured_output_migration.md`；MRV2 复用原生采样 bitmask，不另建协议。
 
 ## 2. 新主线复核结论
@@ -82,7 +82,7 @@ flowchart TD
 
 ### 4.2 启动校验
 
-V2 在加载前拒绝非标准 MTP、batch-sharded sampling、PCP/DCP>1 和 DBO。模型专用 state 先参与原生类型解析，再应用对应 LWD override；当前已组合通用 dense、通用 Mamba hybrid 和仅限 `cudagraph_mode=NONE` 的 DSV4.1 Engram state，未适配的专用 state 不因 LWD 被静默替换。
+V2 在加载前拒绝非标准 MTP、DSpark adaptive verification、batch-sharded sampling、PCP/DCP>1 和 DBO；DSpark 当前也仅允许 `cudagraph_mode=NONE`。模型专用 state 先参与原生类型解析，再应用对应 LWD override；当前已组合通用 dense、通用 Mamba hybrid 和 DSV4.1 Engram state，未适配的专用 state 不因 LWD 被静默替换。
 
 开启方式沿用现有 MRV2 开关，不新增 LWD 环境变量。运行时必须保证 engine 与所有 worker 使用同一套代码和同一开关。
 
@@ -174,9 +174,11 @@ worker 对每个 payload：
 
 `AsyncModelRunnerOutput.get_model_runner_output()` 提供内部 `ModelRunnerOutput` 的公开访问，worker 与 executor 操作同一个对象，不新增第二套 DOWN carrier 或私有兼容别名。
 
-## 8. MTP、placeholder 与 penalties
+## 8. MTP/DSpark、placeholder 与 penalties
 
 MTP 复用公共 speculator 流程，Ascend 只覆写模型加载和图管理。prefill draft 输入按 target query window 右移；非最终 chunk 的最后一行使用 §6.3 的真实下一行 embedding，不能使用零占位。
+
+DSpark eager 直接使用原生 `AscendDSparkSpeculator`，anchor、target hidden 和 draft KV 均保持原生流程。中间 prefill chunk 的 draft token 会被调度器明确忽略，因此 `next_prefill_tokens` 的零占位可以沿用，不做 embedding 反查，也不额外屏蔽任何请求的 draft。
 
 云端 prompt ids 是长度占位而非真实历史：
 
@@ -235,7 +237,7 @@ MTP 复用公共 speculator 流程，Ascend 只覆写模型加载和图管理。
 
 ## 12. DSV4.1 Engram 分阶段适配
 
-MRV2 按“基础 eager、DSpark eager、PIECEWISE、FULL”分阶段适配，保持 MRV1 的边侧 hash 与 UP 数据契约，不回传完整 prompt token ids。第一阶段代码已落地，但尚未完成 NPU 真机验证，当前只允许 `cudagraph_mode=NONE`；DSpark、PIECEWISE 和 FULL 继续 fail-fast。
+MRV2 按“基础 eager、DSpark eager、PIECEWISE、FULL”分阶段适配，保持 MRV1 的边侧 hash 与 UP 数据契约，不回传完整 prompt token ids。前两个阶段代码已落地，但尚未完成 NPU 真机验证，当前只允许 `cudagraph_mode=NONE`；DSpark adaptive verification、PIECEWISE 和 FULL 继续 fail-fast。
 
 第一阶段实现：
 
@@ -244,8 +246,13 @@ MRV2 按“基础 eager、DSpark eager、PIECEWISE、FULL”分阶段适配，�
 - 组合 state 在 `prepare_engram_inputs()` 中替换原生 lookback window，并附加 `external_hashes/external_rows`；target forward 与 Engram dead mask 共用同一份重建 input ids。
 - prompt 长度使用 `req_states.prompt_len`，不把可能包含已生成 token 的 `prefill_len` 当作 Engram prompt 边界；请求结束和 dummy/finish 路径释放或清理对应状态。
 
+第二阶段实现：
+
+- 直接使用原生 `AscendDSparkSpeculator`，保留原生 target hidden、anchor 和 draft KV 流程，不增加 LWD 专用 DSpark speculator。
+- 中间 prefill chunk 的 draft token 被原生调度器忽略，零占位 `next_prefill_tokens` 不参与后续输出，因此不做 embedding 反查或请求级 draft 屏蔽。
+- draft rollback 继续由原生 `num_rejected` 与 Engram 的 device-position lookback 处理，不新增 KV 或 token-id 回传协议。
+
 后续阶段：
 
-- DSpark eager 需审查 anchor、`next_prefill_tokens` 与 draft KV，不因 Engram 接入自动视为支持。
 - PIECEWISE、FULL 均需覆盖。FULL replay 只能读取持久 device buffer，不能复用上一真实 batch 的 row mask 或 hashes；图内 producer 还需贯通 `external_hashes/external_rows`。
 - prefix/refill/preemption/abort/draft rollback 沿用 MRV1 生命周期语义，并在各阶段与集中式、MRV1 做精度对照。
