@@ -5,7 +5,12 @@ import pytest
 import torch
 from transformers import PreTrainedConfig
 
-from vllm.config import ParallelConfig, VllmConfig, set_current_vllm_config
+from vllm.config import (
+    CUDAGraphMode,
+    ParallelConfig,
+    VllmConfig,
+    set_current_vllm_config,
+)
 from vllm.config.model import ModelConfig
 from vllm.config.speculative import SpeculativeConfig
 from vllm.distributed.parallel_state import (
@@ -50,6 +55,21 @@ def _model_config(tmp_path, model_type: str = "qwen3") -> ModelConfig:
     return ModelConfig(model=str(tmp_path), enable_prompt_embeds=True, max_model_len=16)
 
 
+def _dspark_config(tmp_path) -> VllmConfig:
+    speculative_config = SpeculativeConfig(
+        method="draft_model",
+        target_model_config=_model_config(tmp_path),
+        target_parallel_config=ParallelConfig(),
+        model=str(tmp_path),
+        num_speculative_tokens=2,
+    )
+    speculative_config.method = "dspark"
+    return VllmConfig(
+        model_config=_model_config(tmp_path),
+        speculative_config=speculative_config,
+    )
+
+
 @pytest.fixture
 def distributed_runtime(monkeypatch):
     monkeypatch.setenv("RANK", "0")
@@ -80,6 +100,45 @@ def test_lwd_v2_rejects_batch_sharded_sampling() -> None:
         _validate_lwd_v2_config(config)
 
 
+def test_lwd_v2_engram_allows_eager(tmp_path) -> None:
+    config = VllmConfig(model_config=_model_config(tmp_path))
+    config.model_config.hf_text_config.engram_layer_ids = [1]
+    config.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+
+    _validate_lwd_v2_config(config)
+
+
+@pytest.mark.parametrize("mode", [CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL])
+def test_lwd_v2_engram_allows_cudagraphs(tmp_path, mode: CUDAGraphMode) -> None:
+    config = VllmConfig(model_config=_model_config(tmp_path))
+    config.model_config.hf_text_config.engram_layer_ids = [1]
+    config.compilation_config.cudagraph_mode = mode
+
+    _validate_lwd_v2_config(config)
+
+
+def test_lwd_v2_allows_eager_dspark(tmp_path) -> None:
+    config = _dspark_config(tmp_path)
+    config.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+
+    _validate_lwd_v2_config(config)
+
+
+def test_lwd_v2_dspark_allows_cudagraphs(tmp_path) -> None:
+    config = _dspark_config(tmp_path)
+    config.compilation_config.cudagraph_mode = CUDAGraphMode.FULL
+
+    _validate_lwd_v2_config(config)
+
+
+def test_lwd_v2_rejects_dspark_adaptive_verification(tmp_path) -> None:
+    config = _dspark_config(tmp_path)
+    config.speculative_config.enable_adaptive_verification = True
+
+    with pytest.raises(ValueError, match="adaptive verification is deferred"):
+        _validate_lwd_v2_config(config)
+
+
 def test_lwd_runner_selects_default_lwd_state(tmp_path, distributed_runtime) -> None:
     config = VllmConfig(model_config=_model_config(tmp_path))
     runner = LwdCloudModelRunnerV2(config, torch.device("cpu"))
@@ -90,14 +149,14 @@ def test_lwd_runner_selects_default_lwd_state(tmp_path, distributed_runtime) -> 
     assert type(state) is LwdCloudModelState
 
 
-def test_lwd_runner_keeps_custom_state(tmp_path, distributed_runtime) -> None:
+def test_lwd_runner_maps_custom_default_state(tmp_path, distributed_runtime) -> None:
     config = VllmConfig(model_config=_model_config(tmp_path))
     runner = LwdCloudModelRunnerV2(config, torch.device("cpu"))
     runner.model = _CustomStateModel()
 
     state = runner.create_model_state()
 
-    assert type(state) is DefaultModelState
+    assert type(state) is LwdCloudModelState
 
 
 def test_lwd_runner_selects_lwd_mtp_speculator(tmp_path, distributed_runtime) -> None:

@@ -33,14 +33,18 @@ from vllm.v1.worker.gpu.sample.output import SamplerOutput
 
 def _validate_lwd_v2_config(vllm_config: VllmConfig) -> None:
     speculative_config = vllm_config.speculative_config
-    if speculative_config is not None and (
-        speculative_config.method != "mtp"
-        or speculative_config.use_step3p5_mtp()
-        or speculative_config.use_multi_module_mtp()
-    ):
-        raise ValueError("[LWD] MRV2 currently supports only standard MTP speculation")
-    if getattr(vllm_config.model_config.hf_text_config, "engram_layer_ids", None):
-        raise ValueError("[LWD] MRV2 DeepSeek V4.1 Engram support is pending; use MRV1")
+    if speculative_config is not None:
+        if (
+            speculative_config.method not in ("mtp", "dspark")
+            or speculative_config.use_step3p5_mtp()
+            or speculative_config.use_multi_module_mtp()
+        ):
+            raise ValueError("[LWD] MRV2 currently supports standard MTP and DSpark")
+        if (
+            speculative_config.use_dspark()
+            and speculative_config.enable_adaptive_verification
+        ):
+            raise ValueError("[LWD] MRV2 DSpark adaptive verification is deferred")
     parallel_config = vllm_config.parallel_config
     if parallel_config.enable_batch_sharded_sampling:
         raise ValueError("[LWD] MRV2 does not support batch-sharded sampling")
@@ -73,8 +77,6 @@ class LwdCloudModelRunnerMixin(GPUModelRunner):
         return {DefaultModelState: LwdCloudModelState}
 
     def create_model_state(self) -> ModelState:
-        if hasattr(self.model, "get_model_state_cls"):
-            return super().create_model_state()
         native_cls = self.resolve_model_state_cls(self.model)
         model_state_cls = self.lwd_model_state_overrides().get(native_cls, native_cls)
         return init_model_state(
