@@ -82,7 +82,7 @@ flowchart TD
 
 ### 4.2 启动校验
 
-V2 在加载前拒绝非标准 MTP、batch-sharded sampling、PCP/DCP>1 和 DBO。模型专用 state 的优先级不变；当前只组合通用 dense state 与通用 Mamba hybrid state，未适配的专用 state 不因 LWD 被静默替换。
+V2 在加载前拒绝非标准 MTP、batch-sharded sampling、PCP/DCP>1 和 DBO。模型专用 state 先参与原生类型解析，再应用对应 LWD override；当前已组合通用 dense、通用 Mamba hybrid 和仅限 `cudagraph_mode=NONE` 的 DSV4.1 Engram state，未适配的专用 state 不因 LWD 被静默替换。
 
 开启方式沿用现有 MRV2 开关，不新增 LWD 环境变量。运行时必须保证 engine 与所有 worker 使用同一套代码和同一开关。
 
@@ -99,7 +99,7 @@ V2 在加载前拒绝非标准 MTP、batch-sharded sampling、PCP/DCP>1 和 DBO�
 - 在请求增删时维护 M-RoPE、next-prompt 和 req-state；
 - 通过 `compute_sample_logits()` 捕获同一次采样的 logits，数值计算仍委托模型。
 
-通用 Mamba hybrid 使用 `LwdAscendCloudMambaHybridModelState` 组合 LWD 与原生 Mamba 行为；dense 使用 `LwdAscendCloudModelState`。模型自定义 state 始终优先。
+通用 Mamba hybrid 使用 `LwdAscendCloudMambaHybridModelState`，dense 使用 `LwdAscendCloudModelState`，DSV4.1 eager 使用 `LwdAscendCloudEngramModelState`。模型自定义 state 先确定原生类型，再应用对应 LWD override。
 
 ### 5.2 正式社区接口
 
@@ -233,12 +233,19 @@ MTP 复用公共 speculator 流程，Ascend 只覆写模型加载和图管理。
 
 临时诊断及其 revert、非 LWD 的 QSA/社区修复不纳入本次迁移。
 
-## 12. DSV4.1 Engram 后续适配点
+## 12. DSV4.1 Engram 分阶段适配
 
-当前仅完成 MRV1。MRV2 在配置校验中明确拒绝 DSV4.1 Engram，避免模型专用 `EngramModelState` 绕过 LWD state 后静默使用占位 token ids。后续适配保持 MRV1 的边侧 hash 与 UP 数据契约，不回传完整 prompt token ids：
+MRV2 按“基础 eager、DSpark eager、PIECEWISE、FULL”分阶段适配，保持 MRV1 的边侧 hash 与 UP 数据契约，不回传完整 prompt token ids。第一阶段代码已落地，但尚未完成 NPU 真机验证，当前只允许 `cudagraph_mode=NONE`；DSpark、PIECEWISE 和 FULL 继续 fail-fast。
 
-- ModelState 工厂需要对模型自定义 state 也应用 LWD override，新增 `LwdAscendCloudModelState` 与 `EngramModelState` 的组合 state，保留远端 embedding 注入和原生 Engram 图执行。
-- `LwdAscendCloudInputAssembler` 复用 `LwdUpPayloadLayout` 和 `LwdEngramInputs`，按 chunk 写入外部 hashes、图像 spans 与 prompt tail records。
+第一阶段实现：
+
+- ModelState 工厂对模型自定义 state 也应用 LWD override，新增 `LwdAscendCloudEngramModelState` 组合 `LwdAscendCloudModelState` 与 `EngramModelState`，保留远端 embedding 注入和原生 Engram eager 执行。
+- `LwdAscendCloudInputAssembler` 复用 `LwdUpPayloadLayout` 和 `LwdEngramInputs`，按 chunk staging、broadcast 并写入外部 hashes、图像 spans 与 prompt tail records。
 - 组合 state 在 `prepare_engram_inputs()` 中替换原生 lookback window，并附加 `external_hashes/external_rows`；target forward 与 Engram dead mask 共用同一份重建 input ids。
-- eager、PIECEWISE、FULL 均需覆盖。FULL replay 只能读取持久 device buffer，不能复用上一真实 batch 的 row mask 或 hashes。
-- prefix/refill/preemption/abort/draft rollback 沿用 MRV1 生命周期语义；DSpark 另需审查 anchor、`next_prefill_tokens` 与 draft KV，不因 Engram 接入自动视为支持。
+- prompt 长度使用 `req_states.prompt_len`，不把可能包含已生成 token 的 `prefill_len` 当作 Engram prompt 边界；请求结束和 dummy/finish 路径释放或清理对应状态。
+
+后续阶段：
+
+- DSpark eager 需审查 anchor、`next_prefill_tokens` 与 draft KV，不因 Engram 接入自动视为支持。
+- PIECEWISE、FULL 均需覆盖。FULL replay 只能读取持久 device buffer，不能复用上一真实 batch 的 row mask 或 hashes；图内 producer 还需贯通 `external_hashes/external_rows`。
+- prefix/refill/preemption/abort/draft rollback 沿用 MRV1 生命周期语义，并在各阶段与集中式、MRV1 做精度对照。

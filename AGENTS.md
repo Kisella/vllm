@@ -38,7 +38,7 @@ LWD (Layerwise Disaggregated) 是基于 vLLM v1 引擎的边云分布式推理�
 - `vllm/v1/worker/gpu/lwd/`：公共 V2 runner/state、按连接窗口注入、DOWN builder、MTP、penalties 与纯 torch 辅助组件。历史 V1 模块保持原位，未整体切换到这些新组件。
 - 多连接路由使用完整 `LwdConnectionId`；runner 从请求的逻辑 edge 身份解析本实例唯一连接。UP 按连接选择 `_lwd_up_src_ranks` 的真实 endpoint，lookahead 只广播本连接行；DOWN 返回带 connection 的 payload 列表，worker 继续使用 `lwd_down_carriers`。
 - UCX/host staging 沿用 `LwdWorkerBase._init_lwd_data_plane()` 与现有 stager，不恢复旧 HCCL 专用初始化。原生 waiting queue 与 structured output 已在新主线存在，MRV2 只补 lookahead 到达约束，不恢复旧队列。
-- Ascend 云端通用 Mamba hybrid 在 `lwd_cloud_model/v2/model_state.py` 组合 LWD 与 `AscendMambaHybridModelState`；dense 与模型专用 state 的选择不变。
+- Ascend 云端通用 Mamba hybrid 在 `lwd_cloud_model/v2/model_state.py` 组合 LWD 与 `AscendMambaHybridModelState`；DSV4.1 使用 `LwdAscendCloudEngramModelState` 组合 LWD 与 `EngramModelState`，第一阶段仅允许 `cudagraph_mode=NONE`，DSpark 与 PIECEWISE/FULL 仍拒绝；其他模型专用 state 的选择不变。
 - Ascend 边端在 `lwd_edge_execution.py` 共享 embed/unembed 直调执行，V2 只继承原生 V2 runner 与执行 mixin，不继承 V1 runner；空 KV 配置不进入通用 cache 分配。
 - `control_scheduler/lwd_base_engine.py` 与 `lwd_comm/`：engine/worker runner_kind 一致性检查及边云握手版本校验；缺省按 V1 处理，V1/V2 不混用。
 - 正式接口：`ModelState.compute_sample_logits()`/`capture_sample_logits()` 统一 logits 计算与捕获；runner 通过 `create_model_state()`、`create_speculator()` 和 state 类型映射选择实现，模型专用 state 优先，原生工厂不判断 `lwd_config`；异步输出通过 `AsyncModelRunnerOutput.get_model_runner_output()` 获取内部对象，EP fault 查询保持原生行为。

@@ -5,7 +5,12 @@ import pytest
 import torch
 from transformers import PreTrainedConfig
 
-from vllm.config import ParallelConfig, VllmConfig, set_current_vllm_config
+from vllm.config import (
+    CUDAGraphMode,
+    ParallelConfig,
+    VllmConfig,
+    set_current_vllm_config,
+)
 from vllm.config.model import ModelConfig
 from vllm.config.speculative import SpeculativeConfig
 from vllm.distributed.parallel_state import (
@@ -80,6 +85,24 @@ def test_lwd_v2_rejects_batch_sharded_sampling() -> None:
         _validate_lwd_v2_config(config)
 
 
+def test_lwd_v2_engram_allows_eager(tmp_path) -> None:
+    config = VllmConfig(model_config=_model_config(tmp_path))
+    config.model_config.hf_text_config.engram_layer_ids = [1]
+    config.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+
+    _validate_lwd_v2_config(config)
+
+
+@pytest.mark.parametrize("mode", [CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL])
+def test_lwd_v2_engram_rejects_cudagraphs(tmp_path, mode: CUDAGraphMode) -> None:
+    config = VllmConfig(model_config=_model_config(tmp_path))
+    config.model_config.hf_text_config.engram_layer_ids = [1]
+    config.compilation_config.cudagraph_mode = mode
+
+    with pytest.raises(ValueError, match="cudagraph_mode=NONE"):
+        _validate_lwd_v2_config(config)
+
+
 def test_lwd_runner_selects_default_lwd_state(tmp_path, distributed_runtime) -> None:
     config = VllmConfig(model_config=_model_config(tmp_path))
     runner = LwdCloudModelRunnerV2(config, torch.device("cpu"))
@@ -90,14 +113,14 @@ def test_lwd_runner_selects_default_lwd_state(tmp_path, distributed_runtime) -> 
     assert type(state) is LwdCloudModelState
 
 
-def test_lwd_runner_keeps_custom_state(tmp_path, distributed_runtime) -> None:
+def test_lwd_runner_maps_custom_default_state(tmp_path, distributed_runtime) -> None:
     config = VllmConfig(model_config=_model_config(tmp_path))
     runner = LwdCloudModelRunnerV2(config, torch.device("cpu"))
     runner.model = _CustomStateModel()
 
     state = runner.create_model_state()
 
-    assert type(state) is DefaultModelState
+    assert type(state) is LwdCloudModelState
 
 
 def test_lwd_runner_selects_lwd_mtp_speculator(tmp_path, distributed_runtime) -> None:
