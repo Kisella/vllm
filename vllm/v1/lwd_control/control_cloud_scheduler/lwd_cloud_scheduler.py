@@ -14,7 +14,7 @@ the arrived-row high watermark is retained for readmission.
 from __future__ import annotations
 
 import itertools
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, NamedTuple
 
@@ -30,6 +30,7 @@ from vllm.v1.core.sched.output import (
 )
 from vllm.v1.core.sched.scheduler import Scheduler as _NativeScheduler
 from vllm.v1.lwd_control.control_cloud_scheduler.lwd_prefix_cache import (
+    LwdPrefixReservations,
     prefix_start,
 )
 from vllm.v1.lwd_control.control_scheduler.lwd_base_scheduler import (
@@ -98,7 +99,10 @@ class LwdCloudScheduler(LwdBaseScheduler):
         self.lwd_finished_records: dict[str, tuple[int, int, int]] = {}
         self.lwd_hash_block_size = 0
         self.lwd_prefix_hits: dict[str, int] = {}
-        self.lwd_refill_sender = None
+        # Wired by the cloud engine during assembly (prefix-cache init):
+        # reservation table + refill notify sender, or None with caching off.
+        self.lwd_prefix_reservations: LwdPrefixReservations | None = None
+        self.lwd_refill_sender: Callable[[str, int, int, int], None] | None = None
         lwd_logger.info("[cloud-sched] arrival-driven prefill/decode scheduling")
 
     def has_requests(self) -> bool:
@@ -160,13 +164,15 @@ class LwdCloudScheduler(LwdBaseScheduler):
         return decode_exact
 
     def _lwd_prep_prefix_readmission(self, request: Request) -> bool:
-        """Revalidate a preempted request against live blocks and arrivals."""
-        if not getattr(request, "lwd_prefix_probe_succeeded", True):
-            # Fail-open requests have no initial reservation by contract.
-            # Recompute the full prompt after preemption instead of creating a
-            # fictitious zero-hit reservation or triggering a refill.
-            self.lwd_prefix_hits[request.request_id] = 0
-            return True
+        """Revalidate a preempted request against live blocks and arrivals.
+
+        Every admitted request went through nonce/READY negotiation: it
+        carries a reservation floor and its staged prompt may be trimmed up
+        to that floor, regardless of whether the edge's gateway probe
+        succeeded. Readmission must therefore never bypass this
+        revalidation: scheduling below the floor without a refill reads
+        host-stage rows the edge never sent.
+        """
         reservations = getattr(self, "lwd_prefix_reservations", None)
         assert reservations is not None
         floor = self.lwd_prefix_hits.get(

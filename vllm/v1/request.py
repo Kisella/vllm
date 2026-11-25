@@ -197,6 +197,14 @@ class Request:
         self.session_id = session_id
         self.kv_hints = kv_hints
 
+        # LWD control-plane state. Assigned by the LWD edge/cloud engines
+        # (probe negotiation and request notify); the defaults keep non-LWD
+        # deployments untouched.
+        self.lwd_prefix_nonce: int = 0
+        self.lwd_wire_hashes_adopted: bool = False
+        self.lwd_mrope_positions: bytes = b""
+        self.lwd_image_placeholder_spans: list[int] = []
+
         # True if this request is scheduled as a non-final prefill chunk.
         self.is_prefill_chunk = False
 

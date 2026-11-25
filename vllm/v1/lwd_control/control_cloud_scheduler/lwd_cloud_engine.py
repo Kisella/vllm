@@ -29,6 +29,7 @@ import torch
 from vllm.config.lwd import LwdConnectionId
 from vllm.lwd_logger import lwd_logger
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
+from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.engine import EngineCoreRequestType
 from vllm.v1.engine.core import DPEngineCoreProc, EngineCoreProc, EngineShutdownState
 from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_ledger import (
@@ -702,7 +703,7 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             else 0
         )
 
-        def block_hasher(request: Request) -> list[bytes]:
+        def block_hasher(request: Request) -> list[BlockHash]:
             if request.num_output_tokens > 0:
                 return []
             # The cloud holds only a meta placeholder for the prompt
@@ -717,7 +718,7 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
                 and not request.block_hashes
                 and len(req_notify.block_hashes) == expected
             ):
-                return list(req_notify.block_hashes)
+                return [BlockHash(h) for h in req_notify.block_hashes]
             return []
 
         request = Request(
@@ -735,11 +736,10 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         request.lwd_mrope_positions = req_notify.mrope_positions
         request.lwd_image_placeholder_spans = list(req_notify.image_placeholder_spans)
         request.lwd_prefix_nonce = req_notify.prefix_nonce
-        request.lwd_prefix_probe_succeeded = req_notify.prefix_probe_succeeded
         request.lwd_wire_hashes_adopted = (
             local_hasher is not None and len(req_notify.block_hashes) == expected
         )
-        request.block_hashes = list(req_notify.block_hashes)
+        request.block_hashes = [BlockHash(h) for h in req_notify.block_hashes]
         return request
 
     @staticmethod
@@ -770,6 +770,9 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
     def _lwd_coord_wake_loop(self) -> None:
         """Move MP commands to a local queue and wake the engine thread."""
         command_queue = self.cloud_control_command_queue
+        assert command_queue is not None, (
+            "[LWD] coordination wake loop requires the control command queue"
+        )
         while True:
             try:
                 command = command_queue.get()
