@@ -104,6 +104,18 @@ class LwdEdgeProbeManager:
             tuple((target.cloud_id, target.dp_idx) for target in self._targets),
             edge_id=vllm_config.lwd_config.instance_id,
         )
+        # Liveness verdict, cloud-grained (pushed by the engine's sweep):
+        # a fully silent cloud would keep eating fast-fail probes every
+        # cooldown cycle otherwise, and the affected requests would lose
+        # their probe preference.
+        self._silent_clouds: frozenset[int] = frozenset()
+
+    def set_silent_clouds(self, cloud_ids: frozenset[int]) -> None:
+        """Engine thread: stop probing fully silent clouds until their
+        heartbeat returns (the engine re-pushes the empty set on
+        recovery)."""
+        self._silent_clouds = frozenset(cloud_ids)
+
 
     @property
     def enabled(self) -> bool:
@@ -188,6 +200,14 @@ class LwdEdgeProbeManager:
         allowed = {(target.cloud_id, target.dp_idx): target for target in visible}
         healthy = self._health.candidates()
         targets = tuple(allowed[key] for key in healthy if key in allowed)
+        # Liveness exclusion, cloud-grained: a fully silent cloud leaves the
+        # probe rotation until its heartbeat returns. An empty result fails
+        # open — the admission gate owns the fully-silent steady state,
+        # this covers only the sweep-gap race.
+        live = tuple(
+            target for target in targets if target.cloud_id not in self._silent_clouds
+        )
+        targets = live or targets
         if self._uses_prefix_hit(request):
             return targets
         if not targets:

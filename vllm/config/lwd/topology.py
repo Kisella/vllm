@@ -29,6 +29,20 @@ LwdId = Annotated[int, Field(strict=True, ge=0)]
 LwdCount = Annotated[int, Field(strict=True, ge=1)]
 LwdPort = Annotated[int, Field(strict=True, ge=1, le=65535)]
 LwdString = Annotated[StrictStr, Field(pattern=r"\S")]
+LwdPositiveSeconds = Annotated[float, Field(strict=True, gt=0, allow_inf_nan=False)]
+
+
+def _canonical_json(payload: dict[str, Any]) -> bytes:
+    """Deterministic encoding of a validated semantic snapshot: hashing
+    this (never the YAML spelling) is what makes the digests stable under
+    formatting and key order."""
+    return json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
 
 
 def _address(value: str) -> str:
@@ -113,6 +127,19 @@ class LwdHostDataPlane:
     of a link must match."""
 
 
+LWD_API_BIND_BASE_PORT_DEFAULT = 61000
+"""Default ``deployment.api_bind_base_port``: the reserved edge_share
+engine IO band then occupies [61000, 61015]."""
+
+LWD_API_MAX_FRONTENDS = 8
+"""Frontend capacity of the edge_share engine IO band: two reserved
+ports per frontend (``api_bind_base_port + 2*idx / +1``), 16 in total.
+The cap is enforced where ports are actually occupied (the
+``engine_io_addresses`` derivation: bind side, pre-seed and
+registration authority all derive through it), NOT at config time —
+the yaml may describe larger plans."""
+
+
 @dataclass(frozen=True, config=ConfigDict(extra="forbid"))
 class LwdDeployment:
     mode: Annotated[int, Field(strict=True, ge=0, le=0)]
@@ -125,6 +152,31 @@ class LwdDeployment:
     """Host-comm settings block, required when ``data_plane_comm: host``
     and omitted otherwise — the extension point for future host-plane
     properties."""
+    api_bind_base_port: Annotated[int, Field(strict=True, ge=1024, le=65520)] = (
+        LWD_API_BIND_BASE_PORT_DEFAULT
+    )
+    """Base of the reserved edge_share engine IO port band. Attach
+    frontend ``idx`` binds ``base + 2*idx`` (input ROUTER) and ``+1``
+    (output PULL); the whole band ``[base, base + 2*8 - 1]`` is reserved
+    for up to ``LWD_API_MAX_FRONTENDS`` frontends, so deployment ports
+    (``--port``, master/registration ports) must stay out of it. The
+    fixed derivation is what makes a frontend restart rebind the SAME
+    ports, letting the running engine's DEALER/PUSH reconnect
+    transparently. Only meaningful — and only configurable — for
+    ``scene: edge_share``."""
+
+    @model_validator(mode="after")
+    def _validate_api_bind_base_port(self) -> "LwdDeployment":
+        if (
+            self.scene != "edge_share"
+            and self.api_bind_base_port != LWD_API_BIND_BASE_PORT_DEFAULT
+        ):
+            raise ValueError(
+                "[LWD] deployment.api_bind_base_port is an edge_share "
+                f"setting and must not be configured for scene="
+                f"{self.scene!r}"
+            )
+        return self
 
 
 @dataclass(frozen=True, config=ConfigDict(extra="forbid"))
@@ -204,9 +256,6 @@ class LwdScramble:
 class LwdFeatures:
     enable_early_recv: StrictBool = False
     scramble: LwdScramble = Field(default_factory=LwdScramble)
-
-
-LwdPositiveSeconds = Annotated[float, Field(strict=True, gt=0, allow_inf_nan=False)]
 
 
 @dataclass(frozen=True, config=ConfigDict(extra="forbid"))
@@ -338,6 +387,12 @@ class LwdTopology:
     control_plane: LwdControlPlaneConfig = Field(default_factory=LwdControlPlaneConfig)
     digest: str = Field(default="", init=False)
     """First 16 hex characters of the canonical topology SHA-256 digest."""
+    frontend_digest: str = Field(default="", init=False)
+    """First 16 hex of the canonical SHA-256 over everything EXCEPT the
+    instance inventory (edges, clouds, links and the instance-count
+    declarations): the subset every attached frontend must match. An
+    elastic addition changes only the inventory, so this digest stays
+    stable across increments while ``digest`` moves with them."""
 
     @classmethod
     def from_file(cls, path: str) -> "LwdTopology":
@@ -363,21 +418,32 @@ class LwdTopology:
             )
         topology.validate_layout()
         # Hash the validated semantic snapshot, never YAML spelling/layout.
-        # Exclude the derived digest field itself from the canonical payload.
+        # Exclude the derived digest fields themselves from the payload.
         canonical = asdict(topology)
         canonical.pop("digest", None)
+        canonical.pop("frontend_digest", None)
         canonical["instance_links"] = sorted(
             canonical["instance_links"],
             key=lambda link: (link["edge"], link["cloud"]),
         )
-        encoded = json.dumps(
-            canonical,
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=False,
-            allow_nan=False,
-        ).encode("utf-8")
-        object.__setattr__(topology, "digest", sha256(encoded).hexdigest()[:16])
+        object.__setattr__(
+            topology, "digest", sha256(_canonical_json(canonical)).hexdigest()[:16]
+        )
+        frontend = {
+            key: value
+            for key, value in canonical.items()
+            if key not in ("edges", "clouds", "instance_links")
+        }
+        frontend["deployment"] = {
+            key: value
+            for key, value in canonical["deployment"].items()
+            if key not in ("edges_num", "clouds_num")
+        }
+        object.__setattr__(
+            topology,
+            "frontend_digest",
+            sha256(_canonical_json(frontend)).hexdigest()[:16],
+        )
         return topology
 
     @property
@@ -408,6 +474,7 @@ class LwdTopology:
 
     def validate_layout(self) -> None:
         """Validate instance links and placement without initializing communication."""
+        assert self.instance_links is not None
         if (self.deployment.edges_num, self.deployment.clouds_num) != (
             len(self.edges),
             len(self.clouds),
@@ -485,6 +552,7 @@ class LwdTopology:
 
     def _validate_coordination(self) -> None:
         """Require a complete advertised endpoint on every coordinated cloud DP."""
+        assert self.instance_links is not None
         for cloud in self.clouds:
             if cloud.coordination is not None and cloud.coordination.enabled:
                 for dp in cloud.dp:
