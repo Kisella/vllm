@@ -23,9 +23,10 @@ import time
 from collections import deque
 from typing import Any
 
-from vllm.config.lwd import LwdConnectionId
+from vllm.config.lwd import LwdConnectionId, LwdTopologyIncrement
 from vllm.config.lwd.topology import LwdDPConnection
 from vllm.lwd_logger import lwd_logger
+from vllm.utils.network_utils import make_zmq_path
 from vllm.v1.engine import EngineCoreOutputs, EngineCoreRequestType
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_coord_client import (
     LwdCoordClient,
@@ -50,6 +51,9 @@ from vllm.v1.lwd_control.control_scheduler.lwd_base_engine import (
 from vllm.v1.lwd_control.lwd_comm.lwd_control_plane import (
     LwdEdgeControlPlane,
     LwdPeerNotRegisteredError,
+)
+from vllm.v1.lwd_control.lwd_comm.lwd_data_plane_hooks import (
+    notify_data_plane_added,
 )
 from vllm.v1.lwd_control.lwd_comm.lwd_link_protocol import LwdPeer
 from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
@@ -116,11 +120,10 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         # (cloud_id, dp_idx): the engine thread puts, the control-plane IO
         # thread only gets — a keyed read cannot observe a half-applied add.
         self._lwd_runtime_connections: dict[tuple[int, int], LwdDPConnection] = {}
-        # The subset of those whose data-plane links were built: service
-        # (gate + routing) opens only on arm. A refused build keeps the
-        # connection control-plane only; the next detected increment
-        # retries that half.
-        self._lwd_armed_connections: set[tuple[int, int]] = set()
+        # Only connections whose data-plane links are ready open for service.
+        # A refused build keeps the connection control-plane only; the next
+        # detected increment retries that half.
+        self._lwd_serviceable_connections: set[tuple[int, int]] = set()
         self._lwd_prefix_enabled = bool(
             self.vllm_config.cache_config.enable_prefix_caching
         )
@@ -224,9 +227,145 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             self.batch_queue_size,
         )
 
+    def _lwd_apply_topology_increment(self, increment: LwdTopologyIncrement) -> None:
+        """Elastic scale-out: build both halves of every new connection —
+        the control plane (DEALER + handshake + bookkeeping), then the
+        data plane (UCX links), which on success opens the connection for
+        service. Idempotent per connection: serviceable connections replay
+        silently; a connection whose data-plane build was refused retries
+        only that half on the next detected increment."""
+        plane = self._lwd_control_plane
+        assert isinstance(plane, LwdEdgeControlPlane)
+        scene = self.lwd_config.topology.deployment.scene
+        for connection in increment.new_connections:
+            # In lwd_cluster each edge engine serves only its own
+            # instance's connections (other engines watch the same file
+            # and apply their own). In edge_share the shared engine owns
+            # EVERY logical edge — including ones the increment adds
+            # beyond its own startup snapshot — so only lwd_cluster
+            # filters, and by instance identity, never by the startup
+            # connection set.
+            if (
+                scene == "lwd_cluster"
+                and connection.connection_id.edge_id != self.lwd_config.instance_id
+            ):
+                lwd_logger.error(
+                    "[LWD] topology increment %s skipped: owned by edge %d "
+                    "(this engine serves edge %d)",
+                    connection.connection_id,
+                    connection.connection_id.edge_id,
+                    self.lwd_config.instance_id,
+                )
+                continue
+            key = (
+                connection.connection_id.cloud_id,
+                connection.connection_id.dp_idx,
+            )
+            if key in self._lwd_runtime_connections:
+                if key not in self._lwd_serviceable_connections:
+                    self._lwd_open_runtime_connection_for_service(connection)
+                continue
+            if connection.cloud.ctrl_port is None:
+                lwd_logger.error(
+                    "[LWD] topology increment %s dropped: the cloud DP has "
+                    "no ctrl_port",
+                    connection.connection_id,
+                )
+                continue
+            self._lwd_register_probe_cloud(connection)
+            self._lwd_runtime_connections[key] = connection
+            self.scheduler.lwd_add_runtime_connection(connection.connection_id)
+            plane.add_link(
+                make_zmq_path("tcp", connection.cloud.addr, connection.cloud.ctrl_port),
+                connection.connection_id,
+                len(
+                    increment.new_topology.instance(
+                        "cloud", connection.connection_id.cloud_id
+                    ).dp
+                ),
+            )
+            lwd_logger.error(
+                "[LWD] topology increment applied (control plane): "
+                "connection %s -> %s:%s",
+                connection.connection_id,
+                connection.cloud.addr,
+                connection.cloud.ctrl_port,
+            )
+            self._lwd_open_runtime_connection_for_service(connection)
+
+    def _lwd_register_probe_cloud(self, connection: LwdDPConnection) -> None:
+        """Elastic scale-out: teach the probe manager the adopted cloud
+        DP's coordination URL, so probe targeting — and the routing
+        preference probes produce — spreads over every adopted cloud
+        instead of staying pinned to the startup set. On this schema the
+        URL lives in the cloud's own instance block: an explicit
+        ``coord_url`` (DNS/NAT/gateway deployments) wins, else it is
+        derived from this DP's routable address and coordination port —
+        the same host the control-plane DEALER dials."""
+        cloud_dp = connection.cloud
+        if cloud_dp.coord_url is None and cloud_dp.coord_port is None:
+            # An edge_share-scale cloud runs without a coordination block:
+            # no probe targeting for it, by design.
+            lwd_logger.error(
+                "[LWD] probe target %s not registered: the cloud DP has no "
+                "coordination endpoint",
+                connection.connection_id,
+            )
+            return
+        url = cloud_dp.coord_url or f"http://{cloud_dp.addr}:{cloud_dp.coord_port}"
+        # First registration wins: a later replay of the same increment
+        # confirms the rotation membership without rewriting the URL.
+        self._lwd_probe_manager.register_connection(connection.connection_id, url)
+        lwd_logger.error(
+            "[LWD] probe target registered: connection=%s url=%s rotation=%s "
+            "(probes — and the routing preference they produce — now "
+            "spread over every adopted cloud)",
+            connection.connection_id,
+            url,
+            self._lwd_probe_manager.rotation(),
+        )
+
+    def _lwd_open_runtime_connection_for_service(
+        self, connection: LwdDPConnection
+    ) -> None:
+        """Build the connection's data-plane links; on success open it for
+        service (admission gate + routing candidates). A refusal — budget,
+        NPU assembly — keeps the connection control-plane only: the gate
+        keeps rejecting it, and the next detected increment retries this
+        half."""
+        started = time.monotonic()
+        lwd_logger.error(
+            "[LWD] data-plane build start for %s (the engine thread waits "
+            "for the build to return; requests are not served until it "
+            "does)",
+            connection.connection_id,
+        )
+        if not notify_data_plane_added(connection):
+            lwd_logger.error(
+                "[LWD] data-plane build refused for %s (%.1fs); the connection "
+                "stays control-plane only (retried on the next topology "
+                "change)",
+                connection.connection_id,
+                time.monotonic() - started,
+            )
+            return
+        key = (
+            connection.connection_id.cloud_id,
+            connection.connection_id.dp_idx,
+        )
+        self._lwd_serviceable_connections.add(key)
+        self.scheduler.lwd_add_runtime_route(connection.connection_id)
+        lwd_logger.error(
+            "[LWD] runtime connection %s open for service (data plane up, %.1fs)",
+            connection.connection_id,
+            time.monotonic() - started,
+        )
+
     def _lwd_configure_prefix_cache(self) -> None:
         capabilities: set[tuple[int, int, bool, bool]] = set()
-        for dp_idx, params in self._lwd_cloud_params.items():
+        # Snapshot: a straggler cloud's limits can land on the IO thread
+        # while this engine-thread loop runs.
+        for dp_idx, params in tuple(self._lwd_cloud_params.items()):
             if self._lwd_prefix_enabled != params.prefix_caching:
                 raise RuntimeError(
                     f"[LWD] prefix caching mismatch on dp{dp_idx}: "
@@ -269,6 +408,11 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         return lwd_decode_cloud_to_edge(payload)
 
     def _lwd_connection_of(self, peer: LwdPeer) -> LwdConnectionId:
+        # Runtime-added connections first (keyed read on the IO thread),
+        # then the immutable planned set.
+        runtime = self._lwd_runtime_connections.get((peer.instance_id, peer.dp_rank))
+        if runtime is not None:
+            return runtime.connection_id
         return next(
             connection
             for connection in self.lwd_config.connections
@@ -803,12 +947,12 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         # fast with the real reason instead of letting routing score a
         # link that cannot carry traffic. Must sit before the silence
         # check: the silence block returns None (admit) whenever nothing
-        # is silent, and an unarmed connection is never a routing
-        # candidate. An ARMED runtime connection falls through: its
+        # is silent, and a connection that is not serviceable is never a routing
+        # candidate. A serviceable runtime connection falls through: its
         # data plane exists and its heartbeats flow.
         if all(
             (c.cloud_id, c.dp_idx) in self._lwd_runtime_connections
-            and (c.cloud_id, c.dp_idx) not in self._lwd_armed_connections
+            and (c.cloud_id, c.dp_idx) not in self._lwd_serviceable_connections
             for c in scoped
         ):
             return (

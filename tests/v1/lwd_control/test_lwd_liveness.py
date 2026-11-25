@@ -97,10 +97,10 @@ def _edge_engine(
     engine._lwd_hello_silent_s = 10.0
     engine._lwd_last_sweep = 0.0
     engine._lwd_clouds = {connection: None for connection in connections}
-    # The gate's elastic scale-out branch reads the runtime/armed sets;
-    # empty = every planned connection is armed (the pass-through shape).
+    # The gate's elastic scale-out branch reads the runtime/serviceable sets;
+    # empty = every planned connection is serviceable (the pass-through shape).
     engine._lwd_runtime_connections = set()
-    engine._lwd_armed_connections = set()
+    engine._lwd_serviceable_connections = set()
     engine.scheduler = _scheduler_stub(edge_share=edge_share, instance_id=instance_id)
     # Probe-manager stand-in: records the cloud-grained liveness pushes
     # (a fully silent cloud leaves probe targeting until recovery).

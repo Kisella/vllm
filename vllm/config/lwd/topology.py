@@ -678,14 +678,25 @@ class LwdTopology:
 
     def _validate_scene(self) -> None:
         """Validate logical instance shape, independently of physical host count."""
+        assert self.instance_links is not None
         scene = self.deployment.scene
         edge_count, cloud_count = len(self.edges), len(self.clouds)
         if scene == "single_instance" and (edge_count, cloud_count) != (1, 1):
             raise ValueError("[LWD] single_instance requires one edge and one cloud")
-        if scene == "cloud_share" and (edge_count < 2 or cloud_count != 1):
-            raise ValueError("[LWD] cloud_share requires multiple edges and one cloud")
-        if scene == "lwd_cluster" and cloud_count < 2:
-            raise ValueError("[LWD] lwd_cluster requires at least two clouds")
+        # A single-edge cloud_share is the degenerate form of the shared
+        # cloud pipeline: it runs the same coordination machinery (the
+        # scene below still requires enabled coordination blocks) and the
+        # same multi-edge request routing, so a deployment can verify the
+        # whole cloud_share pipeline with one instance and grow by adding
+        # edges — mirroring the degenerate single-pair edge_share form.
+        if scene == "cloud_share" and (edge_count < 1 or cloud_count != 1):
+            raise ValueError(
+                "[LWD] cloud_share requires at least one edge and one cloud"
+            )
+        # lwd_cluster has no minimum-count check beyond the type-level
+        # edges_num/clouds_num >= 1: a 1-edge + 1-cloud deployment is the
+        # degenerate form of the full-mesh pipeline, usable for verification
+        # and gradual scale-out.
         # Coordination may be enabled explicitly in every scene. Shared and
         # multi-cloud scenes require it for every instance.
         if scene in ("cloud_share", "lwd_cluster"):
@@ -702,9 +713,16 @@ class LwdTopology:
                         "an enabled coordination block"
                     )
         if scene == "edge_share":
-            if edge_count != cloud_count or cloud_count < 2:
+            # A single pair is the degenerate form of the shared-edge
+            # pipeline: it runs the attach frontend machinery and the
+            # client_index-based request routing exactly like the N-pair
+            # form, so a deployment can verify the whole pipeline with one
+            # instance and grow by extending the plan. The equal-count
+            # clause below is the actual edge_share invariant; the count
+            # itself is not, and every consumer is count-generic.
+            if edge_count != cloud_count:
                 raise ValueError(
-                    "[LWD] edge_share requires equal multiple edge/cloud IDs"
+                    "[LWD] edge_share requires equal edge/cloud instance IDs"
                 )
             if (
                 len(self.instance_links) != edge_count
@@ -722,6 +740,7 @@ class LwdTopology:
 
     def connections(self, role: str, instance_id: int) -> tuple[LwdDPConnection, ...]:
         """Describe every DP connection for an instance without opening sockets."""
+        assert self.instance_links is not None
         self.instance(role, instance_id)
         result = []
         for link in self.instance_links:
@@ -750,3 +769,227 @@ class LwdTopology:
         raise ValueError(
             f"[LWD] Instance not found: role={role}, instance_id={instance_id}"
         )
+
+
+# --------------------------------------------------------------------- #
+# Runtime topology update (host-comm edge_share elastic scale-out)       #
+# --------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class LwdTopologyIncrement:
+    """A validated pure-addition update for a running Host engine.
+
+    ``new_connections`` are everything Phase B/C must build. The startup
+    topology remains the diff baseline; ``new_topology`` is only candidate
+    data carried with this increment and never advances that baseline. An
+    empty ``new_connections`` is a no-op (the file was touched but its
+    semantics did not change)."""
+
+    new_edge_ids: tuple[int, ...]
+    new_cloud_ids: tuple[int, ...]
+    new_connections: tuple[LwdDPConnection, ...]
+    new_topology: LwdTopology
+
+
+@dataclass(frozen=True)
+class LwdTopologyUpdateRejected:
+    """A runtime topology update that violates the increment contract.
+
+    ``reason`` names the broken rule and the exact field. The engine keeps
+    serving on its realized snapshot; the verdict is deterministic, so
+    re-reading the same file yields the same result."""
+
+    reason: str
+
+
+def _first_change(path: str, old: Any, new: Any) -> str | None:
+    """Deepest differing field of two ``asdict`` trees, as ``path: a -> b``."""
+    if isinstance(old, dict) and isinstance(new, dict):
+        for key in sorted(set(old) | set(new)):
+            if key not in old:
+                return f"{path}.{key}: <absent> -> {new[key]!r}"
+            if key not in new:
+                return f"{path}.{key}: {old[key]!r} -> <absent>"
+            if old[key] != new[key]:
+                return _first_change(f"{path}.{key}", old[key], new[key])
+        return None
+    if isinstance(old, (list, tuple)) and isinstance(new, (list, tuple)):
+        if len(old) != len(new):
+            return f"{path}: {len(old)} -> {len(new)} entries"
+        for index, (old_item, new_item) in enumerate(zip(old, new)):
+            if old_item != new_item:
+                return _first_change(f"{path}[{index}]", old_item, new_item)
+        return None
+    return f"{path}: {old!r} -> {new!r}"
+
+
+def _frozen_blocks(topology: LwdTopology) -> dict[str, Any]:
+    """Global blocks an increment must not touch: deployment (minus the
+    instance-count declarations, which follow the added instances),
+    feature_ctrl and control_plane. ``qos`` is exempt by deployment
+    guarantee, not by code (2026-11-18 review decision)."""
+    deployment = asdict(topology.deployment)
+    deployment.pop("edges_num")
+    deployment.pop("clouds_num")
+    return {
+        "deployment": deployment,
+        "feature_ctrl": asdict(topology.feature_ctrl),
+        "control_plane": asdict(topology.control_plane),
+    }
+
+
+def _relaxed_edge_snapshot(
+    snapshot: dict[str, Any], added_clouds: set[int]
+) -> dict[str, Any]:
+    """R2 no-op on this schema: an existing EDGE never needs an edit when
+    clouds are added, because a new cloud's coordination URL lives in the
+    cloud's own instance block (``LwdDP.coord_url``), not in the edge's
+    coordination. The old-branch exemption (growing an edge's
+    ``coordination.control_url_map``) targeted a field this schema retired
+    — ``LwdCoordination.reject_legacy_fields`` rejects it outright — so R2
+    stays a strict byte-identical comparison and this helper documents why
+    no exemption is needed here."""
+    return snapshot
+
+
+def diff_topology(
+    old: LwdTopology, new: LwdTopology
+) -> LwdTopologyIncrement | LwdTopologyUpdateRejected:
+    """Validate a runtime topology update as a pure addition (v1 contract).
+
+    Preconditions: both topologies come from ``from_dict``, so the full
+    layout validation (scene shape, port uniqueness, count consistency,
+    contiguous instance ids, link completeness) already ran. The rules, in
+    order:
+
+    * R0 the scene stays the same — and only Host deployment scenes have
+      runtime-update semantics: ``edge_share`` adds whole edge/cloud pairs,
+      ``cloud_share`` adds edges, and ``lwd_cluster`` adds either role with
+      full-mesh links. A same-shape ``single_instance`` file parses clean,
+      so the scene must be compared explicitly;
+    * R1 global blocks are frozen (see ``_frozen_blocks``): they size the
+      realized pools (``up_buffer_size``), seed channel scrambling and
+      configure the control plane — none can be applied retroactively;
+    * R2 every realized instance survives byte-identical, dp list and
+      coordination block included — which also pins every realized
+      connection and rules out shrink (scale-in keeps its existing
+      kill + liveness semantics). No exemption is needed on this
+      schema: a new cloud's coordination URL lives in the cloud's own
+      ``LwdDP.coord_url`` block, so adding a cloud requires no edit to
+      any existing instance (the old-branch ``control_url_map``
+      exemption targeted a field this schema retired);
+    * R3 links are addition-only: a swap of realized links is a change;
+    * R4 the addition shape is the scene's: edge_share adds whole
+      instance pairs and a new link may not cross old and new instances
+      (one-to-one); cloud_share adds edges only and every new link MUST
+      cross (new edge -> the existing cloud), per the full-mesh scene.
+
+    Instance ids are append-only by construction: layout validation
+    requires ids unique and contiguous from 0, so a valid addition can
+    only append the next id."""
+    if old.digest == new.digest:
+        return LwdTopologyIncrement((), (), (), new)
+    if old.deployment.scene != new.deployment.scene:
+        return LwdTopologyUpdateRejected(
+            f"scene changed: {old.deployment.scene} -> {new.deployment.scene}"
+        )
+    if old.deployment.scene not in (
+        "edge_share",
+        "cloud_share",
+        "lwd_cluster",
+    ):
+        return LwdTopologyUpdateRejected(
+            f"scene {old.deployment.scene} has no runtime-update "
+            "semantics; restart the engine to change its plan"
+        )
+    frozen_old = _frozen_blocks(old)
+    frozen_new = _frozen_blocks(new)
+    for name, old_block in frozen_old.items():
+        change = _first_change(name, old_block, frozen_new[name])
+        if change is not None:
+            return LwdTopologyUpdateRejected(f"global block changed: {change}")
+    old_edges = {instance.id for instance in old.edges}
+    old_clouds = {instance.id for instance in old.clouds}
+    added_clouds = {instance.id for instance in new.clouds} - old_clouds
+    for role, old_instances, new_instances in (
+        ("edge", old.edges, new.edges),
+        ("cloud", old.clouds, new.clouds),
+    ):
+        new_by_id = {instance.id: instance for instance in new_instances}
+        for instance in old_instances:
+            fresh = new_by_id.get(instance.id)
+            if fresh is None:
+                return LwdTopologyUpdateRejected(
+                    f"instance removed: {role} {instance.id} (shrink is not "
+                    "supported; scale-in keeps the kill + liveness semantics)"
+                )
+            fresh_snapshot = (
+                _relaxed_edge_snapshot(asdict(fresh), added_clouds)
+                if role == "edge"
+                else asdict(fresh)
+            )
+            change = _first_change(
+                f"{role} {instance.id}", asdict(instance), fresh_snapshot
+            )
+            if change is not None:
+                return LwdTopologyUpdateRejected(
+                    f"existing instance modified: {change}"
+                )
+    assert old.instance_links is not None
+    assert new.instance_links is not None
+    old_links = set(old.instance_links)
+    new_links = set(new.instance_links)
+
+    def link_key(link: LwdLink) -> tuple[int, int]:
+        return (link.edge, link.cloud)
+
+    if old_links - new_links:
+        removed = sorted(old_links - new_links, key=link_key)[0]
+        return LwdTopologyUpdateRejected(
+            f"link removed: edge {removed.edge} - cloud {removed.cloud}"
+        )
+    added_links = sorted(new_links - old_links, key=link_key)
+    new_edge_ids = tuple(sorted({instance.id for instance in new.edges} - old_edges))
+    new_cloud_ids = tuple(sorted({instance.id for instance in new.clouds} - old_clouds))
+    if old.deployment.scene == "edge_share":
+        for link in added_links:
+            if (link.edge in old_edges) != (link.cloud in old_clouds):
+                return LwdTopologyUpdateRejected(
+                    f"new link crosses old and new instances: "
+                    f"edge {link.edge} - cloud {link.cloud}"
+                )
+        if len(new_edge_ids) != len(new_cloud_ids):
+            return LwdTopologyUpdateRejected(
+                f"additions must be instance pairs: {len(new_edge_ids)} "
+                f"edge(s) vs {len(new_cloud_ids)} cloud(s)"
+            )
+    elif old.deployment.scene == "cloud_share":
+        if new_cloud_ids:
+            return LwdTopologyUpdateRejected(
+                f"cloud_share additions are edges only; new cloud(s) "
+                f"{list(new_cloud_ids)} (restart the cloud to change its "
+                "own plan)"
+            )
+        for link in added_links:
+            if link.edge not in new_edge_ids or link.cloud not in old_clouds:
+                return LwdTopologyUpdateRejected(
+                    f"a cloud_share addition links every new edge to the "
+                    f"existing cloud; got edge {link.edge} - cloud "
+                    f"{link.cloud}"
+                )
+    # lwd_cluster needs no shape-specific check: the full-mesh scene
+    # validation already enforces that every new edge links every cloud
+    # and every new cloud is linked from every edge.
+    connections: list[LwdDPConnection] = []
+    for link in added_links:
+        # Filter by the link's cloud: in lwd_cluster a new cloud means
+        # existing edges gain a connection to it, and `connections("edge",
+        # edge)` returns ALL of that edge's pairs — only the one to this
+        # link's cloud is new. In edge_share/cloud_share the filter is a
+        # no-op (a new edge's every connection is new).
+        edge_conns = new.connections("edge", link.edge)
+        connections.extend(
+            conn for conn in edge_conns if conn.connection_id.cloud_id == link.cloud
+        )
+    return LwdTopologyIncrement(new_edge_ids, new_cloud_ids, tuple(connections), new)

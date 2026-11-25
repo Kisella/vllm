@@ -27,7 +27,7 @@ from typing import Any
 import msgspec
 import torch
 
-from vllm.config.lwd import LwdConnectionId
+from vllm.config.lwd import LwdConnectionId, LwdTopologyIncrement
 from vllm.lwd_logger import lwd_logger
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.v1.engine import EngineCoreRequestType
@@ -48,7 +48,10 @@ from vllm.v1.lwd_control.control_scheduler.lwd_base_engine import (
 from vllm.v1.lwd_control.control_scheduler.lwd_base_scheduler import (
     lwd_spec_factor,
 )
-from vllm.v1.lwd_control.lwd_comm.lwd_control_plane import LwdPeerNotRegisteredError
+from vllm.v1.lwd_control.lwd_comm.lwd_control_plane import (
+    LwdCloudControlPlane,
+    LwdPeerNotRegisteredError,
+)
 from vllm.v1.lwd_control.lwd_comm.lwd_id_adapter import unwrap_req_id, wrap_req_id
 from vllm.v1.lwd_control.lwd_comm.lwd_link_protocol import LwdPeer
 from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
@@ -609,6 +612,148 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         return LwdConnectionId(
             peer.instance_id, self.lwd_config.instance_id, peer.dp_rank
         )
+
+    def _lwd_apply_topology_increment(self, increment: LwdTopologyIncrement) -> None:
+        """C-2/C-3/C-4: admit each new edge to the handshake allowlist,
+        build its data-plane pair on the shared listener, and wire its
+        hint/done MQ pair. The rest of the join is the existing runtime
+        machinery — registration resets the seqno ledgers and resends
+        the scheduling limits, the heartbeat fan-out picks the peer up
+        from `_lwd_edges`. A data-plane or MQ refusal keeps the edge
+        control-plane only; the next detected increment retries.
+        Idempotent per edge and per connection: replays do not disturb
+        the live allowlist, the listener's route table or the MQs."""
+        plane = self._lwd_control_plane
+        assert isinstance(plane, LwdCloudControlPlane)
+        # In lwd_cluster each cloud engine serves only its own instance's
+        # connections (other cloud engines watch the same file and apply
+        # their own). In cloud_share this filter is a no-op (every new
+        # connection goes to the single shared cloud).
+        my_connections = [
+            connection
+            for connection in increment.new_connections
+            if connection.connection_id.cloud_id == self.lwd_config.instance_id
+        ]
+        for edge_id in increment.new_edge_ids:
+            # Only admit edges that connect to THIS cloud.
+            if not any(
+                c.connection_id.edge_id == edge_id
+                and c.connection_id.cloud_id == self.lwd_config.instance_id
+                for c in my_connections
+            ):
+                continue
+            plane.allow_edge(edge_id)
+            lwd_logger.error(
+                "[LWD][cloud] edge %d admitted to the handshake allowlist "
+                "(topology increment)",
+                edge_id,
+            )
+        for connection in my_connections:
+            # The UCX listener, token route table and IO registry live in
+            # the WORKER processes (MultiprocExecutor); the data-plane
+            # hook registry is process-local and empty in the EngineCore.
+            # Build via collective_rpc: the endpoint Worker (the one
+            # that owns the shared listener) does the work, others return
+            # None (not their job, distinct from False = refused).
+            results = self.model_executor.collective_rpc(
+                "lwd_build_runtime_connection", args=(connection,)
+            )
+            built = any(result is True for result in results)
+            if not built:
+                lwd_logger.error(
+                    "[LWD] data-plane build refused for %s; the edge's UP "
+                    "frames will keep retrying the listener (retried on "
+                    "the next topology change)",
+                    connection.connection_id,
+                )
+                continue
+            lwd_logger.error(
+                "[LWD] runtime connection %s built (serve pair on the shared listener)",
+                connection.connection_id,
+            )
+            self._lwd_wire_runtime_hint_mq(connection.connection_id)
+
+    def _lwd_wire_runtime_hint_mq(self, connection: LwdConnectionId) -> None:
+        """C-4: wire one runtime connection's hint/done MQ pair — the
+        engine creates the hint MQ, registers the hint sender, RPCs the
+        worker to attach/create the per-connection MQs (passing the hint
+        MQ's handle explicitly: env vars do NOT cross the process
+        boundary in MultiprocExecutor at runtime — they only work at
+        startup where workers inherit the engine's env), and stores the
+        returned done MQ handle for the drain loop. Idempotent: an
+        already-wired connection skips. A failed attempt rolls back its
+        local resources so a later topology increment can retry."""
+        if connection in self._lwd_hint_mqs:
+            return
+        from vllm_ascend.worker.lwd_cloud_model.lwd_pre_recv import (
+            _encode_handle,
+            _hint_senders,
+            create_hint_mq,
+            register_hint_sender,
+        )
+
+        hint_mq = None
+        done_mq = None
+        sender = None
+        previous_sender = _hint_senders.get(connection)
+        try:
+            hint_mq = create_hint_mq(connection)
+
+            def send_hint(hint: dict[str, Any], mq: Any = hint_mq) -> None:
+                mq.enqueue(hint)
+
+            sender = send_hint
+            register_hint_sender(sender, connection)
+            hint_handle_str = _encode_handle(hint_mq.export_handle())
+            handles = [
+                handle
+                for handle in self.model_executor.collective_rpc(
+                    "lwd_attach_runtime_connection_mqs",
+                    args=(connection, hint_handle_str),
+                )
+                if handle is not None
+            ]
+            if len(handles) != 1:
+                lwd_logger.error(
+                    "[LWD] runtime MQ wiring failed for %s: expected one "
+                    "endpoint worker to report a done MQ handle, got %d; "
+                    "rolling back for a later topology increment to retry",
+                    connection,
+                    len(handles),
+                )
+            else:
+                from vllm.distributed.device_communicators.shm_broadcast import (
+                    MessageQueue,
+                )
+
+                done_mq = MessageQueue.create_from_handle(handles[0], 0)
+        except Exception:
+            lwd_logger.exception(
+                "[LWD] runtime MQ wiring failed for %s; rolling back for "
+                "a later topology increment to retry",
+                connection,
+            )
+        else:
+            if hint_mq is not None and done_mq is not None:
+                self._lwd_hint_mqs[connection] = hint_mq
+                self._lwd_done_mqs[connection] = done_mq
+                lwd_logger.error("[LWD] runtime hint/done MQs wired for %s", connection)
+                return
+
+        if sender is not None and _hint_senders.get(connection) is sender:
+            if previous_sender is None:
+                _hint_senders.pop(connection, None)
+            else:
+                _hint_senders[connection] = previous_sender
+        for mq in (done_mq, hint_mq):
+            if mq is None:
+                continue
+            try:
+                mq.shutdown()
+            except Exception:
+                lwd_logger.exception(
+                    "[LWD] runtime MQ rollback cleanup failed for %s", connection
+                )
 
     def _lwd_handle_range_notify(
         self, connection_id: LwdConnectionId, notify: LwdRangeNotify

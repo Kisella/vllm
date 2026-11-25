@@ -116,10 +116,26 @@ class LwdEdgeProbeManager:
         recovery)."""
         self._silent_clouds = frozenset(cloud_ids)
 
+    def rotation(self) -> tuple[tuple[int, int], ...]:
+        """Cloud-DP ids the health rotation may target (diagnostics)."""
+        return self._health.targets
+
+    def register_connection(self, connection_id: LwdConnectionId, url: str) -> None:
+        """Teach the manager a runtime-adopted connection's coordination
+        URL and open it for probe targeting (elastic scale-out: the
+        rotation widens without restarting, so probes — and the routing
+        preference they produce — spread over all adopted clouds). First
+        registration wins; replays only confirm the health-rotation
+        membership (idempotent)."""
+        self._targets.setdefault(connection_id, url.rstrip("/"))
+        self._health.add_target((connection_id.cloud_id, connection_id.dp_idx))
 
     @property
     def enabled(self) -> bool:
         coordination = self._vllm_config.lwd_config.coordination
+        # Runtime-adopted connections count too: register_connection adds
+        # to _targets, so elastic scale-out widens probing without a
+        # restart.
         return bool(coordination and coordination.enabled and self._targets)
 
     @property
@@ -422,7 +438,20 @@ class LwdEdgeProbeManager:
             for target, result, chain, build_size, error in outcome:
                 dp_id = (target.cloud_id, target.dp_idx)
                 if error is not None or result is None:
-                    self._health.record_failure(dp_id)
+                    if self._health.record_failure(dp_id):
+                        # The rotation skips this cloud DP until its cooldown
+                        # expires (or a probe succeeds after it) — the
+                        # "all requests stayed on the other cloud"
+                        # signature when the target is a runtime-adopted
+                        # cloud whose HTTP endpoint is not answering.
+                        logger.error(
+                            "[LWD] probe target cloud=%d dp=%d entered cooldown "
+                            "after repeated failures (url=%s); it re-enters "
+                            "the rotation once a probe succeeds",
+                            target.cloud_id,
+                            target.dp_idx,
+                            self._targets.get(target),
+                        )
                     failed.append(target)
                     continue
                 self._health.record_success(dp_id)

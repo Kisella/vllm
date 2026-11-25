@@ -203,11 +203,33 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         account.prefix_alignment_tokens = max(0, params.prefix_alignment_tokens)
         account.prefix_alignment_required = params.prefix_alignment_required
 
+    def lwd_add_runtime_connection(self, connection_id: LwdConnectionId) -> None:
+        """Seed a runtime-added connection's bookkeeping BEFORE its link
+        opens: the cloud's limits can arrive on the IO thread within one
+        hello-retry of registration and `lwd_update_cloud_params`
+        subscripts these maps. Idempotent. The connection deliberately
+        does NOT join the routing candidates — the admission gate keeps
+        rejecting it until its data-plane link exists (a later phase),
+        and routing an unservable connection is worse than refusing it."""
+        if connection_id not in self._lwd_accounts:
+            self._lwd_accounts[connection_id] = LwdCloudDpAccount(connection_id)
+        self._lwd_aborted_req_ids.setdefault(connection_id, [])
+
     def lwd_update_silent_routes(self, silent: frozenset[LwdConnectionId]) -> None:
         """Engine thread: the liveness sweep's frozen verdict (a cloud DP
         went silent, or its heartbeat resumed). One atomic frozenset swap;
         routing reads it on the same thread."""
         self._lwd_silent_routes = silent
+
+    def lwd_add_runtime_route(self, connection_id: LwdConnectionId) -> None:
+        """Open a runtime connection for service: it joins the routing
+        candidates (sorted, so the round-robin order stays stable).
+        Idempotent. Legacy int-indexed send watermarks
+        (`_lwd_connections[dp_idx]`) predate runtime additions and keep
+        meaning link indices of the startup plan."""
+        if connection_id in self._lwd_connections:
+            return
+        self._lwd_connections = tuple(sorted((*self._lwd_connections, connection_id)))
 
     def _lwd_dp_of(self, request_id: str) -> LwdConnectionId:
         """Routed dp_idx of an active request; unrouted ids are a bug."""
@@ -295,7 +317,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             candidates = healthy
         if preferred is not None and preferred not in candidates:
             # The probe produced a preference the router cannot honor: the
-            # connection is not an armable routing candidate (data-plane
+            # connection is not a serviceable routing candidate (data-plane
             # build refused) or the liveness sweep declared it silent. The
             # request silently falls back — this log is the elastic
             # scale-out diagnosis cue.
