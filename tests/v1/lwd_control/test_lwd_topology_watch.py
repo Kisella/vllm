@@ -673,6 +673,9 @@ def test_the_cloud_engine_admits_edges_and_builds_the_data_plane(
         topology=LwdTopology.from_dict(yaml.safe_load(topology_file.read_text())),
         instance_id=0,
     )
+    engine.vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(data_parallel_index=0)
+    )
     engine._lwd_topology_file_digest = engine.lwd_config.topology.digest
     engine._lwd_control_plane = _RecordingCloudPlane()
     engine._lwd_hint_mqs = {}
@@ -708,6 +711,48 @@ def test_the_cloud_engine_admits_edges_and_builds_the_data_plane(
     assert engine._lwd_control_plane.allowed == [1, 1]
     assert built == [LwdConnectionId(1, 0, 0), LwdConnectionId(1, 0, 0)]
     assert wired == [LwdConnectionId(1, 0, 0)]  # not re-wired
+
+
+def test_cloud_apply_adopts_only_its_own_dp_connections(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A multi-DP cloud runs one engine per DP. Every engine sees the same
+    topology increment, but only the DP whose data_parallel_index matches
+    the connection's dp_idx may adopt it — otherwise each Worker extends
+    state with the other DPs' connection ids and the runner loses
+    per-edge connection uniqueness."""
+    built: list = []
+
+    class _Plane(LwdCloudControlPlane):
+        def __init__(self) -> None:
+            self.allowed: list[int] = []
+
+        def allow_edge(self, edge_id: int) -> None:
+            self.allowed.append(edge_id)
+
+    def fake_collective_rpc(name: str, args: Any = None) -> list[Any]:
+        assert name == "lwd_build_runtime_connection"
+        built.append(args[0].connection_id)
+        return [True, None]
+
+    engine = object.__new__(LwdCloudEngineCore)
+    engine.lwd_config = SimpleNamespace(instance_id=0)
+    engine.vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(data_parallel_index=0)
+    )
+    engine._lwd_control_plane = _Plane()
+    engine._lwd_hint_mqs = {}
+    engine._lwd_done_mqs = {}
+    engine.model_executor = SimpleNamespace(collective_rpc=fake_collective_rpc)
+    monkeypatch.setattr(engine, "_lwd_wire_runtime_hint_mq", lambda connection: None)
+
+    own = SimpleNamespace(connection_id=LwdConnectionId(1, 0, 0))
+    other_dp = SimpleNamespace(connection_id=LwdConnectionId(1, 0, 1))
+    increment = SimpleNamespace(new_edge_ids=(1,), new_connections=(own, other_dp))
+    engine._lwd_apply_topology_increment(increment)
+
+    assert built == [LwdConnectionId(1, 0, 0)]
+    assert engine._lwd_control_plane.allowed == [1]
 
 
 def _cloud_share_write(path: Path, edges: int) -> None:
