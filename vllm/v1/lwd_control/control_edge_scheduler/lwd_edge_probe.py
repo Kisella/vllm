@@ -104,17 +104,20 @@ class LwdEdgeProbeManager:
             tuple((target.cloud_id, target.dp_idx) for target in self._targets),
             edge_id=vllm_config.lwd_config.instance_id,
         )
-        # Liveness verdict, cloud-grained (pushed by the engine's sweep):
-        # a fully silent cloud would keep eating fast-fail probes every
-        # cooldown cycle otherwise, and the affected requests would lose
-        # their probe preference.
-        self._silent_clouds: frozenset[int] = frozenset()
 
     def set_silent_clouds(self, cloud_ids: frozenset[int]) -> None:
-        """Engine thread: stop probing fully silent clouds until their
-        heartbeat returns (the engine re-pushes the empty set on
-        recovery)."""
-        self._silent_clouds = frozenset(cloud_ids)
+        """Verdict subscriber: mirror the cloud-grained liveness verdict
+        into the health rotation. Called from the heartbeat monitor's single
+        event exit point, on whichever thread detected the transition.
+        Cloud ids expand to ``(cloud_id, dp_idx)`` here so the tracker stays
+        keyed by cloud DP; ``candidates()`` then owns the exclusion and its
+        fail-open, and no second liveness set has to be kept in sync. The
+        monitor re-pushes the empty set on recovery."""
+        self._health.set_silent(
+            frozenset(
+                target for target in self._health.targets if target[0] in cloud_ids
+            )
+        )
 
     def rotation(self) -> tuple[tuple[int, int], ...]:
         """Cloud-DP ids the health rotation may target (diagnostics)."""
@@ -214,16 +217,12 @@ class LwdEdgeProbeManager:
     ) -> tuple[LwdConnectionId, ...]:
         visible = self._visible_targets(edge_id)
         allowed = {(target.cloud_id, target.dp_idx): target for target in visible}
-        healthy = self._health.candidates()
+        # Cooling-down DPs, this edge's visibility and the liveness verdict
+        # are all resolved inside the health tracker now (in that order),
+        # including the probe-side fail-open. No second liveness set is
+        # kept here, and next() keeps its original rotation semantics.
+        healthy = self._health.candidates(scope=frozenset(allowed), exclude_silent=True)
         targets = tuple(allowed[key] for key in healthy if key in allowed)
-        # Liveness exclusion, cloud-grained: a fully silent cloud leaves the
-        # probe rotation until its heartbeat returns. An empty result fails
-        # open — the admission gate owns the fully-silent steady state,
-        # this covers only the sweep-gap race.
-        live = tuple(
-            target for target in targets if target.cloud_id not in self._silent_clouds
-        )
-        targets = live or targets
         if self._uses_prefix_hit(request):
             return targets
         if not targets:

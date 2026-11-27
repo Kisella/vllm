@@ -369,9 +369,10 @@ spread over both clouds (round-robin preference via probe completions;
 an not serviceable or cooling cloud falls back to the serviceable candidates).
 
 **Partial-death routing (2026-11-20)**: a stopped cloud must not keep
-eating traffic while its sibling serves. The liveness sweep's frozen
-verdict (`_lwd_silent_routes`) is mirrored into the scheduler at BOTH
-transitions — death (sweep) and recovery (beat) — via
+eating traffic while its sibling serves. The `LwdHeartbeatMonitor`'s frozen
+verdict (`verdict.silent_routes`) is published at its single event exit
+point and mirrored into the scheduler at BOTH transitions — death (sweep)
+and recovery (activity) — via
 `lwd_update_silent_routes`; `_lwd_route_request` filters the silent
 routes out of the round-robin candidates, failing open when every
 candidate is silent (the gate owns the fully-silent rejection at

@@ -410,6 +410,37 @@ def test_runtime_registration_alone_enables_probing() -> None:
         manager.close()
 
 
+def test_set_silent_clouds_is_held_only_in_the_health_tracker() -> None:
+    """Scheme C: the cloud-grained liveness verdict is expanded to
+    (cloud_id, dp_idx) and kept in ONE place — the health tracker. The
+    probe manager no longer owns a parallel _silent_clouds set, and
+    candidates() does the exclusion (with its fail-open)."""
+    manager = LwdEdgeProbeManager(
+        _config_for(
+            [
+                _connection(0, 0, 0),
+                _connection(0, 0, 1),
+                _connection(0, 1, 0),
+            ]
+        ),
+        lambda: None,
+    )
+    try:
+        assert not hasattr(manager, "_silent_clouds")
+        manager.set_silent_clouds(frozenset({1}))
+        assert manager._health.silent == frozenset({(1, 0)})
+        assert manager._health.candidates(exclude_silent=True) == ((0, 0), (0, 1))
+        manager.set_silent_clouds(frozenset())
+        assert manager._health.silent == frozenset()
+        assert manager._health.candidates(exclude_silent=True) == (
+            (0, 0),
+            (0, 1),
+            (1, 0),
+        )
+    finally:
+        manager.close()
+
+
 def test_silent_clouds_leave_probe_targeting_until_recovered() -> None:
     """Cloud-grained liveness verdict: a fully silent cloud leaves probe
     targeting; the empty verdict (the resumed beat) restores the fanout;

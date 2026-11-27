@@ -57,6 +57,11 @@
 | `control_cloud_scheduler/lwd_cloud_engine.py` (+150) | `_lwd_boot_id` + 心跳常驻线程 + 引擎线程按拍发送（不可达对端剪除）；`_lwd_handle_peer_registered`（边重注册→seqno 账本复位 + 调度参数补发，即迟加入边的收编入口）；`_lwd_retire_connection_requests`（link_error 瞬态隔离，退役不标永久）；done-MQ link_error 路由 |
 | `config/lwd/topology.py` (+17) | `hello_interval_s=1.0` / `hello_silent_s=10.0` / `submit_wait_ready_s`（配置文件优先，对齐老仓 env 语义） |
 
+> **后续重构（不在本清单的提交内）**：活性层已从 `lwd_edge_engine.py` 抽出为独立的
+> `control_edge_scheduler/lwd_heartbeat.py`（`LwdHeartbeatMonitor`）。它独占三账与静默
+> 判定、在单一事件出口发布不可变 `LwdHeartbeatVerdict` 并触发拆链；引擎只装配与订阅，
+> 门禁/路由/abort 走只读接口，健康 tracker 只缓存 verdict。上表描述的是移植当时的形态。
+
 ### 控制面测试
 
 `tests/v1/lwd_control/test_lwd_liveness`（424 行：心跳/静默/门禁/弹性未收编拒绝/路由与发送防护）、

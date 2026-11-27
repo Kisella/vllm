@@ -33,6 +33,9 @@ from vllm.v1.lwd_control.control_edge_scheduler import lwd_edge_engine
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_engine import (
     LwdEdgeEngineCore,
 )
+from vllm.v1.lwd_control.control_edge_scheduler.lwd_heartbeat import (
+    LwdHeartbeatMonitor,
+)
 from vllm.v1.lwd_control.control_scheduler import lwd_base_engine
 from vllm.v1.lwd_control.control_scheduler.lwd_base_engine import LwdBaseEngineCore
 from vllm.v1.lwd_control.lwd_comm.lwd_control_plane import (
@@ -407,15 +410,10 @@ def test_a_refused_data_plane_opens_for_service_on_the_next_increment(
     _write(topology_file, _payload(1))
     engine = _engine(topology_file)
     # Liveness state the gate reads (a runtime adoption is recorded in
-    # _lwd_clouds by the control-plane IO thread in production): set up
-    # front, both gate checks below run against it.
-    engine._lwd_hello_lock = threading.Lock()
-    engine._lwd_hello_last = {LwdConnectionId(1, 1, 0): time.monotonic()}
-    engine._lwd_business_last = {}
-    engine._lwd_hello_boot = {}
-    engine._lwd_silent = set()
-    engine._lwd_silent_routes = frozenset()
-    engine._lwd_hello_silent_s = 10.0
+    # _lwd_clouds by the control-plane IO thread in production): seed the
+    # monitor up front, both gate checks below run against it.
+    engine._lwd_heartbeat = LwdHeartbeatMonitor(10.0, 1.0)
+    engine._lwd_heartbeat.note_adopted(LwdConnectionId(1, 1, 0))
     engine._lwd_clouds = {LwdConnectionId(1, 1, 0): None}
     _write(topology_file, _payload(2))
     first = engine._lwd_process_topology_reload()
@@ -539,13 +537,8 @@ def test_the_gate_rejects_a_control_plane_only_connection(
     topology_file = tmp_path / "topology.yaml"
     _write(topology_file, _payload(1))
     engine = _engine(topology_file)
-    engine._lwd_hello_lock = threading.Lock()
-    engine._lwd_hello_last = {LwdConnectionId(1, 1, 0): time.monotonic()}
-    engine._lwd_business_last = {}
-    engine._lwd_hello_boot = {}
-    engine._lwd_silent = set()
-    engine._lwd_silent_routes = frozenset()
-    engine._lwd_hello_silent_s = 10.0
+    engine._lwd_heartbeat = LwdHeartbeatMonitor(10.0, 1.0)
+    engine._lwd_heartbeat.note_adopted(LwdConnectionId(1, 1, 0))
     engine._lwd_clouds = {LwdConnectionId(1, 1, 0): None}
     engine._lwd_runtime_connections = {(1, 0): None}
     reason = engine._lwd_gate_reason(SimpleNamespace(request_id="e1-wrapped-req"))

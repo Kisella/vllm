@@ -130,10 +130,14 @@ on **one** receive path.
 
 - The cloud control plane publishes a periodic HELLO (old default 1 s) carrying a
   `boot_id` epoch (random per process launch);
-- The edge keeps per-`(cloud_id, dp_idx)` accounts — `hello_last`, a separate
+- The edge keeps per-connection accounts — `hello_last`, a separate
   `business_last` (any valid cloud-to-edge request frame), `hello_boot`, a silent
-  set with `frozenset` snapshots (single-writer on the receive thread, main
-  thread reads snapshots — the old branch's concurrency shape). The judge reads
+  set with `frozenset` snapshots — in an independent `LwdHeartbeatMonitor`
+  (`control_edge_scheduler/lwd_heartbeat.py`), not in the engine. It owns the
+  detection, emits one immutable `LwdHeartbeatVerdict` at a single event exit
+  point, and fires the teardown; consumers only subscribe or read its
+  read-only query surface (`is_alive`, `silent_routes`, `silent_clouds`,
+  `boot_id`, `last_activity`). The judge reads
   `max(hello_last, business_last)`: a heartbeat frame stuck behind a busy
   outbound FIFO, or a cloud engine thread busy with a long step, no longer
   makes a cloud that is still answering requests look dead. Boot-id tracking
@@ -154,8 +158,18 @@ on **one** receive path.
   retries (refresh + re-accept, `registered=False`).
 - **Availability gate**: the edge engine's admission check rejects new requests
   with `FinishReason.ERROR` while every known route is silent (partial silence
-  rejects only requests whose target group is silent). The gate releases on the
-  next heartbeat or business frame. Rejection is a client-visible failure, retryable — not a hang.
+  rejects only requests whose target group is silent). It reads the monitor's
+  `silent_routes()` (frozen verdict unioned with a live staleness view), so a
+  cloud that went quiet while the engine idled cannot admit the request that
+  wakes it. The gate releases on the next heartbeat or business frame.
+  Rejection is a client-visible failure, retryable — not a hang.
+- **Single event exit**: the monitor publishes its verdict to subscribers —
+
+  `scheduler.lwd_update_silent_routes` and the probe manager (which forwards
+  to `LwdCloudHealthTracker`). The tracker only caches the verdict; it never
+  runs detection. There is no second liveness set pushed by hand at the two
+  transitions. The hard availability decision (gate / routing / teardown)
+  stays out of the tracker, whose fail-open belongs to probe targeting only.
 
 The heartbeat cadence and the silent threshold are code constants at
 their use sites — `LWD_HELLO_INTERVAL_S` in the cloud engine,

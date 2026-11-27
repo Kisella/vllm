@@ -23,13 +23,16 @@ from vllm.config.lwd.topology import LwdConnectionId
 from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_engine import (
     LwdCloudEngineCore,
 )
-from vllm.v1.lwd_control.control_edge_scheduler import lwd_edge_engine
+from vllm.v1.lwd_control.control_edge_scheduler import lwd_heartbeat
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_engine import (
     LwdEdgeEngineCore,
 )
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_scheduler import (
     LwdCloudDpAccount,
     LwdEdgeScheduler,
+)
+from vllm.v1.lwd_control.control_edge_scheduler.lwd_heartbeat import (
+    LwdHeartbeatMonitor,
 )
 from vllm.v1.lwd_control.lwd_comm import lwd_restart_hooks as hooks_module
 from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
@@ -89,17 +92,11 @@ def _edge_engine(
     instance_id: int = 0,
 ) -> LwdEdgeEngineCore:
     engine = object.__new__(LwdEdgeEngineCore)
-    engine._lwd_hello_lock = threading.Lock()
-    engine._lwd_hello_last = {
-        connection: time.monotonic() for connection in connections
-    }
-    engine._lwd_business_last = {}
-    engine._lwd_hello_boot = {}
-    engine._lwd_silent = set()
-    engine._lwd_silent_routes = frozenset()
-    engine._lwd_hello_silent_s = 10.0
-    engine._lwd_last_sweep = 0.0
+    monitor = LwdHeartbeatMonitor(10.0, 1.0)
+    engine._lwd_heartbeat = monitor
     engine._lwd_clouds = {connection: None for connection in connections}
+    for connection in connections:
+        monitor.note_adopted(connection)
     # The gate's elastic scale-out branch reads the runtime/serviceable sets;
     # empty = every planned connection is serviceable (the pass-through shape).
     engine._lwd_runtime_connections = set()
@@ -110,8 +107,18 @@ def _edge_engine(
     probe = SimpleNamespace(silent_pushes=[])
     probe.set_silent_clouds = lambda ids: probe.silent_pushes.append(ids)
     engine._lwd_probe_manager = probe
+    # The monitor is the single event exit point: both consumers subscribe,
+    # exactly as the engine wires them at assembly time.
+    monitor.subscribe(
+        lambda verdict: engine.scheduler.lwd_update_silent_routes(verdict.silent_routes)
+    )
+    monitor.subscribe(
+        lambda verdict: engine._lwd_probe_manager.set_silent_clouds(
+            verdict.silent_clouds
+        )
+    )
     monkeypatch.setattr(
-        lwd_edge_engine,
+        lwd_heartbeat,
         "notify_cloud_restarted",
         lambda cloud_id, dp_idx, reason: notified.append((cloud_id, dp_idx, reason)),
     )
@@ -127,19 +134,18 @@ def test_heartbeat_codec_round_trip() -> None:
 def test_beat_detects_a_boot_id_change(monkeypatch: pytest.MonkeyPatch) -> None:
     notified: list = []
     engine = _edge_engine(monkeypatch, [CONNECTION], notified)
-    engine._lwd_beat(CONNECTION, "boot-a")
+    engine._lwd_heartbeat.note_activity(CONNECTION, heartbeat_boot_id="boot-a")
     assert notified == []  # the first boot id is not a restart
-    engine._lwd_beat(CONNECTION, "boot-b")
+    engine._lwd_heartbeat.note_activity(CONNECTION, heartbeat_boot_id="boot-b")
     assert notified == [(0, 0, "boot id changed")]
 
 
 def test_beat_releases_the_gate_after_silence(monkeypatch: pytest.MonkeyPatch) -> None:
     notified: list = []
     engine = _edge_engine(monkeypatch, [CONNECTION], notified)
-    engine._lwd_silent = {CONNECTION}
-    engine._lwd_silent_routes = frozenset({CONNECTION})
-    engine._lwd_beat(CONNECTION, "boot-a")
-    assert engine._lwd_silent_routes == frozenset()
+    engine._lwd_heartbeat._silent = {CONNECTION}
+    engine._lwd_heartbeat.note_activity(CONNECTION, heartbeat_boot_id="boot-a")
+    assert engine._lwd_heartbeat.frozen_silent_routes() == frozenset()
     assert notified == []
     # Recovery releases the ROUTING exclusion together with the gate.
     assert engine.scheduler.silent_pushes[-1] == frozenset()
@@ -152,9 +158,9 @@ def test_sweep_marks_silent_and_fires_the_teardown(
 ) -> None:
     notified: list = []
     engine = _edge_engine(monkeypatch, [CONNECTION], notified)
-    engine._lwd_hello_last[CONNECTION] = time.monotonic() - 30.0
-    engine._lwd_sweep_liveness()
-    assert engine._lwd_silent_routes == frozenset({CONNECTION})
+    engine._lwd_heartbeat._hello_last[CONNECTION] = time.monotonic() - 30.0
+    engine._lwd_heartbeat.sweep()
+    assert engine._lwd_heartbeat.frozen_silent_routes() == frozenset({CONNECTION})
     assert len(notified) == 1
     assert notified[0][0] == 0 and notified[0][1] == 0
     assert "no cloud activity" in notified[0][2]
@@ -165,8 +171,8 @@ def test_sweep_marks_silent_and_fires_the_teardown(
     # adopted route of it is silent) leaves probe targeting.
     assert engine._lwd_probe_manager.silent_pushes[-1] == frozenset({0})
     # The silent transition fires once: a second sweep does not re-notify.
-    engine._lwd_last_sweep = 0.0
-    engine._lwd_sweep_liveness()
+    engine._lwd_heartbeat._last_sweep = 0.0
+    engine._lwd_heartbeat.sweep()
     assert len(notified) == 1
 
 
@@ -181,13 +187,13 @@ def test_probe_targeting_leaves_only_fully_silent_clouds(
     dp0 = LwdConnectionId(0, 0, 0)
     dp1 = LwdConnectionId(0, 0, 1)
     engine = _edge_engine(monkeypatch, [dp0, dp1], notified)
-    engine._lwd_hello_last[dp0] = time.monotonic() - 30.0
-    engine._lwd_sweep_liveness()
+    engine._lwd_heartbeat._hello_last[dp0] = time.monotonic() - 30.0
+    engine._lwd_heartbeat.sweep()
     # dp0 silent, dp1 alive: cloud 0 still answers probes.
     assert engine._lwd_probe_manager.silent_pushes[-1] == frozenset()
-    engine._lwd_hello_last[dp1] = time.monotonic() - 30.0
-    engine._lwd_last_sweep = 0.0
-    engine._lwd_sweep_liveness()
+    engine._lwd_heartbeat._hello_last[dp1] = time.monotonic() - 30.0
+    engine._lwd_heartbeat._last_sweep = 0.0
+    engine._lwd_heartbeat.sweep()
     # Every adopted route of cloud 0 is silent: probe targeting skips it
     # until activity resumes.
     assert engine._lwd_probe_manager.silent_pushes[-1] == frozenset({0})
@@ -201,10 +207,10 @@ def test_business_traffic_keeps_a_cloud_alive_without_heartbeats(
     that the cloud process is still answering requests."""
     notified: list = []
     engine = _edge_engine(monkeypatch, [CONNECTION], notified)
-    engine._lwd_hello_last[CONNECTION] = time.monotonic() - 30.0
-    engine._lwd_note_cloud_activity(CONNECTION)
-    engine._lwd_sweep_liveness()
-    assert engine._lwd_silent_routes == frozenset()
+    engine._lwd_heartbeat._hello_last[CONNECTION] = time.monotonic() - 30.0
+    engine._lwd_heartbeat.note_activity(CONNECTION)
+    engine._lwd_heartbeat.sweep()
+    assert engine._lwd_heartbeat.frozen_silent_routes() == frozenset()
     assert notified == []
     assert (
         engine._lwd_gate_reason(SimpleNamespace(request_id="r", client_index=0)) is None
@@ -219,10 +225,9 @@ def test_business_traffic_releases_a_silent_verdict(
     evidence of life, NOT a restart, so no teardown hook fires."""
     notified: list = []
     engine = _edge_engine(monkeypatch, [CONNECTION], notified)
-    engine._lwd_silent = {CONNECTION}
-    engine._lwd_silent_routes = frozenset({CONNECTION})
-    engine._lwd_note_cloud_activity(CONNECTION)
-    assert engine._lwd_silent_routes == frozenset()
+    engine._lwd_heartbeat._silent = {CONNECTION}
+    engine._lwd_heartbeat.note_activity(CONNECTION)
+    assert engine._lwd_heartbeat.frozen_silent_routes() == frozenset()
     assert engine.scheduler.silent_pushes[-1] == frozenset()
     assert engine._lwd_probe_manager.silent_pushes[-1] == frozenset()
     assert notified == []
@@ -237,10 +242,10 @@ def test_stale_heartbeat_and_stale_traffic_still_mark_silent(
     notified: list = []
     engine = _edge_engine(monkeypatch, [CONNECTION], notified)
     old = time.monotonic() - 30.0
-    engine._lwd_hello_last[CONNECTION] = old
-    engine._lwd_business_last[CONNECTION] = old
-    engine._lwd_sweep_liveness()
-    assert engine._lwd_silent_routes == frozenset({CONNECTION})
+    engine._lwd_heartbeat._hello_last[CONNECTION] = old
+    engine._lwd_heartbeat._business_last[CONNECTION] = old
+    engine._lwd_heartbeat.sweep()
+    assert engine._lwd_heartbeat.frozen_silent_routes() == frozenset({CONNECTION})
     assert len(notified) == 1
 
 
@@ -251,25 +256,28 @@ def test_dispatch_of_a_business_frame_refreshes_activity(
     otherwise the second evidence channel would exist but never be used."""
     notified: list = []
     engine = _edge_engine(monkeypatch, [CONNECTION], notified)
-    engine._lwd_hello_last[CONNECTION] = time.monotonic() - 30.0
+    engine._lwd_heartbeat._hello_last[CONNECTION] = time.monotonic() - 30.0
     engine.input_queue = _RecordingQueue()
     monkeypatch.setattr(engine, "_lwd_connection_of", lambda peer: CONNECTION)
     peer = SimpleNamespace(instance_id=0, dp_rank=0)
     msg = LwdPrefixReadyNotify(request_id="r", hit_tokens=3, nonce=1)
     assert engine._lwd_dispatch_message(peer, msg) is True
-    assert CONNECTION in engine._lwd_business_last
-    assert engine._lwd_business_last[CONNECTION] > engine._lwd_hello_last[CONNECTION]
+    assert CONNECTION in engine._lwd_heartbeat._business_last
+    assert (
+        engine._lwd_heartbeat._business_last[CONNECTION]
+        > engine._lwd_heartbeat._hello_last[CONNECTION]
+    )
     assert len(engine.input_queue.items) == 1
-    engine._lwd_sweep_liveness()
-    assert engine._lwd_silent_routes == frozenset()
+    engine._lwd_heartbeat.sweep()
+    assert engine._lwd_heartbeat.frozen_silent_routes() == frozenset()
 
 
 def test_sweep_is_rate_limited(monkeypatch: pytest.MonkeyPatch) -> None:
     notified: list = []
     engine = _edge_engine(monkeypatch, [CONNECTION], notified)
-    engine._lwd_hello_last[CONNECTION] = time.monotonic() - 30.0
-    engine._lwd_sweep_liveness()
-    engine._lwd_sweep_liveness()  # within the sweep interval: no-op
+    engine._lwd_heartbeat._hello_last[CONNECTION] = time.monotonic() - 30.0
+    engine._lwd_heartbeat.sweep()
+    engine._lwd_heartbeat.sweep()  # within the sweep interval: no-op
     assert len(notified) == 1
 
 
@@ -317,12 +325,12 @@ def test_gate_rejects_only_when_the_routes_are_silent(
     edge0_req = SimpleNamespace(request_id="chatcmpl-x", client_index=0)
     edge1_req = SimpleNamespace(request_id="chatcmpl-y", client_index=1)
     assert engine._lwd_gate_reason(edge0_req) is None
-    engine._lwd_silent_routes = frozenset({CONNECTION_E1})
+    engine._lwd_heartbeat._silent = {CONNECTION_E1}
     # Whole-route silence rejects everything.
-    engine._lwd_silent_routes = frozenset({CONNECTION, CONNECTION_E1})
+    engine._lwd_heartbeat._silent = {CONNECTION, CONNECTION_E1}
     assert engine._lwd_gate_reason(edge0_req) is not None
     # Partial silence: edge 0 still has a live route.
-    engine._lwd_silent_routes = frozenset({CONNECTION_E1})
+    engine._lwd_heartbeat._silent = {CONNECTION_E1}
     assert engine._lwd_gate_reason(edge0_req) is None
     # A request whose source edge is fully silent is rejected.
     assert engine._lwd_gate_reason(edge1_req) is not None
@@ -335,8 +343,10 @@ def test_gate_uses_live_staleness_before_the_first_sweep(
     engine idled must not admit the very request that wakes it."""
     notified: list = []
     engine = _edge_engine(monkeypatch, [CONNECTION], notified)
-    engine._lwd_hello_last[CONNECTION] = time.monotonic() - 30.0
-    assert engine._lwd_silent_routes == frozenset()  # no sweep has run
+    engine._lwd_heartbeat._hello_last[CONNECTION] = time.monotonic() - 30.0
+    assert (
+        engine._lwd_heartbeat.frozen_silent_routes() == frozenset()
+    )  # no sweep has run
     request = SimpleNamespace(request_id="chatcmpl-x", client_index=0)
     assert engine._lwd_gate_reason(request) is not None
 
@@ -429,7 +439,7 @@ def test_gate_rejection_uses_the_abort_channel_only(
     from types import SimpleNamespace
 
     engine = _edge_engine(monkeypatch, [CONNECTION], [])
-    engine._lwd_silent_routes = frozenset({CONNECTION})
+    engine._lwd_heartbeat._silent = {CONNECTION}
     engine.aborts_queue = _RecordingQueue()
     engine.input_queue = _RecordingQueue()
     request = SimpleNamespace(request_id="chatcmpl-x", client_index=0)
@@ -451,7 +461,7 @@ def test_entry_gate_rejects_before_the_probe_machinery(
 
     notified: list = []
     engine = _edge_engine(monkeypatch, [CONNECTION], notified)
-    engine._lwd_silent_routes = frozenset({CONNECTION})
+    engine._lwd_heartbeat._silent = {CONNECTION}
     errored: list = []
     monkeypatch.setattr(
         engine,
@@ -489,7 +499,8 @@ def test_abort_skips_the_cloud_notify_for_silent_connections(
     engine = object.__new__(LwdEdgeEngineCore)
     engine._lwd_probe_manager = SimpleNamespace(abort=lambda request_id: None)
     engine._lwd_probe_chains = {}
-    engine._lwd_silent_routes = frozenset({CONNECTION})
+    engine._lwd_heartbeat = LwdHeartbeatMonitor(10.0, 1.0)
+    engine._lwd_heartbeat._silent = {CONNECTION}
     sent: list = []
     engine.scheduler = SimpleNamespace(
         lwd_edge_abort=lambda ids: [
@@ -669,9 +680,9 @@ def test_beat_survives_the_mid_assembly_window(monkeypatch: pytest.MonkeyPatch) 
     notified: list = []
     engine = _edge_engine(monkeypatch, [], notified)  # no connections seeded
     # A beat for a connection the handshake has not even discovered yet.
-    engine._lwd_beat(CONNECTION, "boot-a")
-    assert engine._lwd_hello_last[CONNECTION] > 0
-    assert engine._lwd_hello_boot[CONNECTION] == "boot-a"
+    engine._lwd_heartbeat.note_activity(CONNECTION, heartbeat_boot_id="boot-a")
+    assert engine._lwd_heartbeat._hello_last[CONNECTION] > 0
+    assert engine._lwd_heartbeat._boot[CONNECTION] == "boot-a"
     # The gate does not blow up mid-assembly: with nothing adopted yet it
     # returns the elastic no-adoption reason (a clean rejection), never an
     # exception off the half-assembled state.

@@ -19,6 +19,9 @@ from vllm.config.lwd.topology import LwdConnectionId
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_engine import (
     LwdEdgeEngineCore,
 )
+from vllm.v1.lwd_control.control_edge_scheduler.lwd_heartbeat import (
+    LwdHeartbeatMonitor,
+)
 from vllm.v1.lwd_control.lwd_comm.lwd_messages import LwdCloudParamsNotify
 
 CLOUD_0 = LwdConnectionId(0, 0, 0)
@@ -36,12 +39,8 @@ def _engine() -> LwdEdgeEngineCore:
     engine.vllm_config = SimpleNamespace(
         scheduler_config=SimpleNamespace(max_num_batched_tokens=8192, max_num_seqs=64)
     )
-    engine._lwd_hello_lock = threading.Lock()
-    engine._lwd_hello_last = {CLOUD_0: 1.0}
-    engine._lwd_business_last = {}
-    engine._lwd_hello_boot = {}
-    engine._lwd_silent = set()
-    engine._lwd_silent_routes = frozenset()
+    engine._lwd_heartbeat = LwdHeartbeatMonitor(10.0, 1.0)
+    engine._lwd_heartbeat.note_adopted(CLOUD_0)
     engine._lwd_runtime_connections = {}
     # Cloud 0 is the accepted startup subset; cloud 1 starts later.
     engine._lwd_clouds = {CLOUD_0: SimpleNamespace(instance_id=0, dp_rank=0)}
@@ -78,7 +77,7 @@ def test_late_cloud_params_adopt_the_connection() -> None:
     assert engine._lwd_cloud_params[CLOUD_1] is msg
     assert engine._lwd_coord_clients == {}  # no coordinator addr -> no client
     assert engine._lwd_probe_manager._hash_sizes[1] == msg.prefix_hash_block_size
-    assert CLOUD_1 in engine._lwd_hello_last  # liveness account seeded
+    assert CLOUD_1 in engine._lwd_heartbeat._hello_last  # liveness seeded
     assert engine._lwd_cloud_params_received.is_set()
     assert updates == [(CLOUD_1, msg)]
 
