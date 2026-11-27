@@ -81,8 +81,12 @@ tests/v1/lwd_control/test_worker_base_weave_guard.py  # pre-existing LWD suite n
 tests/v1/lwd_comm/test_sock.py  # pre-existing LWD suite not wired into CI
 tests/v1/lwd_comm/test_ucx_shm.py  # pre-existing LWD suite not wired into CI
 tests/v1/lwd_comm/test_ucx_symbol_contract.py  # pre-existing LWD suite not wired into CI
+tests/v1/lwd_comm/test_lwd_ucx_state_log.py  # pre-existing LWD suite not wired into CI
 tests/v1/lwd_control/test_lwd_cloud_control_bridge.py  # pre-existing LWD suite not wired into CI
 tests/v1/lwd_control/test_lwd_cloud_dp_wave.py  # pre-existing LWD suite not wired into CI
 tests/v1/lwd_control/test_lwd_cloud_health.py  # pre-existing LWD suite not wired into CI
 tests/v1/lwd_control/test_lwd_edge_client.py  # pre-existing LWD suite not wired into CI
+tests/v1/lwd_control/test_lwd_edge_probe.py  # pre-existing LWD suite not wired into CI
+tests/v1/lwd_control/test_lwd_edge_route_rotation.py  # pre-existing LWD suite not wired into CI
+tests/v1/lwd_control/test_lwd_edge_scheduler.py  # pre-existing LWD suite not wired into CI
 tests/v1/lwd_control/test_lwd_frontend_routing.py  # pre-existing LWD suite not wired into CI

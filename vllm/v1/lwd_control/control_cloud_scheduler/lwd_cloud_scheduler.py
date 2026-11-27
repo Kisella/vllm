@@ -96,7 +96,7 @@ class LwdCloudScheduler(LwdBaseScheduler):
         )
         self.pending_c2e: list[LwdC2eNotify] = []
         self._lwd_prefill_group_cursor = 0
-        self.lwd_finished_records: dict[str, tuple[int, int, int]] = {}
+        self.lwd_finished_records: dict[str, tuple[int, int | None, int]] = {}
         self.lwd_hash_block_size = 0
         self.lwd_prefix_hits: dict[str, int] = {}
         # Wired by the cloud engine during assembly (prefix-cache init):

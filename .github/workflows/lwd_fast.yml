@@ -19,4 +19,4 @@ jobs:
     with:
       upstream_repo: vllm-project/vllm
       source_roots: vllm/
-      pre_commit_skip: mypy-3.10
+      pre_commit_skip: mypy
