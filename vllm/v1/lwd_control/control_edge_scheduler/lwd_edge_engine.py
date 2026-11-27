@@ -93,13 +93,16 @@ LWD_EDGE_HOST_SLOTS_PER_INSTANCE = 2
 LWD_PREFIX_READY_TIMEOUT_S = 60.0
 # Liveness sweep rate limit: the verdict's latency granularity.
 _LWD_SWEEP_INTERVAL_S = 1.0
-# Seconds without a cloud heartbeat before the edge tears that cloud DP's
-# data-plane links down and gates new requests to it; the next heartbeat
-# releases the gate. Also bounds the in-flight failure latency of the
-# teardown. This threshold and the cloud's heartbeat cadence
-# (LWD_HELLO_INTERVAL_S in lwd_cloud_engine) are the two halves of ONE
-# liveness contract — the judge's threshold and the sender's pace — so
-# any change must consider both files together.
+# Seconds without ANY cloud activity (heartbeat or a valid business frame)
+# before the edge tears that cloud DP's data-plane links down and gates new
+# requests to it; the next heartbeat or business frame releases the gate.
+# Also bounds the in-flight failure latency of the teardown. This threshold
+# and the cloud's heartbeat cadence (LWD_HELLO_INTERVAL_S in
+# lwd_cloud_engine) are the two halves of ONE liveness contract — the
+# judge's threshold and the sender's pace — so any change must consider
+# both files together. Business traffic is a second, independent evidence
+# of life: a heartbeat frame queued behind a busy outbound FIFO must not
+# make a healthy cloud look dead.
 LWD_HELLO_SILENT_S = 10.0
 
 # A full outbound queue is retried with growing intervals (about 3 s in
@@ -146,13 +149,18 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         self._lwd_cloud_params_received = threading.Event()
         # Liveness state (peer-restart line) must exist BEFORE the control
         # plane starts: its IO thread dispatches payloads into this engine
-        # immediately, and a heartbeat arriving mid-assembly (long handshake
-        # or params waits) hit a half-constructed object — the AttributeError
-        # spam, with each hit ALSO queueing an engine failure through
-        # on_message's _lwd_fail. Only the connection seeding below needs
-        # the handshake result; beats write into the dict directly.
+        # immediately, and a heartbeat or a business frame arriving
+        # mid-assembly (long handshake or params waits) hit a
+        # half-constructed object — the AttributeError spam, with each hit
+        # ALSO queueing an engine failure through on_message's _lwd_fail.
+        # Only the connection seeding below needs the handshake result;
+        # activity records write into the dicts directly.
         self._lwd_hello_lock = threading.Lock()
         self._lwd_hello_last: dict[LwdConnectionId, float] = {}
+        self._lwd_business_last: dict[LwdConnectionId, float] = {}
+        """Last valid business payload per cloud DP. Any request-related
+        frame proves the process is alive even when heartbeat frames are
+        queued behind traffic or the cloud engine thread is busy."""
         self._lwd_hello_boot: dict[LwdConnectionId, str] = {}
         self._lwd_silent: set[LwdConnectionId] = set()
         self._lwd_silent_routes: frozenset[LwdConnectionId] = frozenset()
@@ -423,9 +431,13 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
     def _lwd_dispatch_message(self, peer: LwdPeer, msg: LwdMessage) -> bool:
         """Cloud limits -> record and wake the startup wait; heartbeats ->
         liveness accounts; c2e -> scheduler notify queue + WAKEUP; anything
-        else is unknown."""
+        else is unknown. Every accepted frame also refreshes the cloud DP's
+        activity evidence, so a cloud that is answering requests is never
+        judged dead just because its heartbeat was delayed."""
         if isinstance(msg, LwdCloudHeartbeat):
-            self._lwd_beat(self._lwd_connection_of(peer), msg.boot_id)
+            self._lwd_note_cloud_activity(
+                self._lwd_connection_of(peer), heartbeat_boot_id=msg.boot_id
+            )
             return True
         if isinstance(msg, LwdCloudParamsNotify):
             connection = self._lwd_connection_of(peer)
@@ -436,12 +448,15 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             self._lwd_adopt_cloud(connection, peer, msg)
             self.scheduler.lwd_update_cloud_params(connection, msg)
             self._lwd_cloud_params_received.set()
+            self._lwd_note_cloud_activity(connection)
             return True
         if isinstance(msg, (LwdPrefixReadyNotify, LwdRefillNotify)):
+            self._lwd_note_cloud_activity(self._lwd_connection_of(peer))
             self.input_queue.put_nowait((EngineCoreRequestType.WAKEUP, msg))
             return True
         if isinstance(msg, LwdC2eNotify):
             connection_id = self._lwd_connection_of(peer)
+            self._lwd_note_cloud_activity(connection_id)
             lwd_logger.info(
                 "[edge] c2e received from %s reqs=%d hidden_numel=%d",
                 connection_id,
@@ -824,14 +839,34 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             self.abort_requests(request_ids)
         return [], False
 
-    def _lwd_beat(self, connection: LwdConnectionId, boot_id: str) -> None:
-        """Control-plane IO thread: one cloud heartbeat arrived. A boot-id
-        change is a cloud-restart verdict; recovery from silence releases
-        the gate via the snapshot refresh."""
+    def _lwd_note_cloud_activity(
+        self,
+        connection: LwdConnectionId,
+        *,
+        heartbeat_boot_id: str | None = None,
+    ) -> None:
+        """Control-plane IO thread: any valid frame from a cloud DP proves
+        that process is alive.
+
+        Heartbeats carry a ``boot_id`` epoch (a change is a restart verdict);
+        business payloads only refresh the activity timestamp. Either kind
+        releases a silent verdict, so a cloud still answering requests is
+        not torn down merely because its heartbeat was queued behind traffic
+        or the cloud engine thread was busy with a long step.
+        """
+        now = time.monotonic()
+        previous_boot = None
+        boot_changed = False
         with self._lwd_hello_lock:
-            self._lwd_hello_last[connection] = time.monotonic()
-            previous_boot = self._lwd_hello_boot.get(connection)
-            self._lwd_hello_boot[connection] = boot_id
+            if heartbeat_boot_id is not None:
+                self._lwd_hello_last[connection] = now
+                previous_boot = self._lwd_hello_boot.get(connection)
+                self._lwd_hello_boot[connection] = heartbeat_boot_id
+                boot_changed = (
+                    previous_boot is not None and previous_boot != heartbeat_boot_id
+                )
+            else:
+                self._lwd_business_last[connection] = now
             was_silent = connection in self._lwd_silent
             if was_silent:
                 self._lwd_silent.discard(connection)
@@ -843,24 +878,39 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             self.scheduler.lwd_update_silent_routes(self._lwd_silent_routes)
             self._lwd_probe_manager.set_silent_clouds(self._lwd_silent_probe_clouds())
             lwd_logger.error(
-                "[edge] %s back after silence (heartbeat resumed)", connection
+                "[edge] %s back after silence (%s resumed)",
+                connection,
+                "heartbeat" if heartbeat_boot_id is not None else "cloud traffic",
             )
-        if previous_boot is not None and previous_boot != boot_id:
+        if boot_changed:
             lwd_logger.error(
                 "[edge] %s RESTARTED (boot_id %s -> %s)",
                 connection,
                 previous_boot,
-                boot_id,
+                heartbeat_boot_id,
             )
             notify_cloud_restarted(
                 connection.cloud_id, connection.dp_idx, "boot id changed"
             )
 
+    def _lwd_beat(self, connection: LwdConnectionId, boot_id: str) -> None:
+        """Control-plane IO thread: one cloud heartbeat arrived."""
+        self._lwd_note_cloud_activity(connection, heartbeat_boot_id=boot_id)
+
+    def _lwd_last_activity(self) -> dict[LwdConnectionId, float]:
+        """Caller holds ``_lwd_hello_lock``: newest evidence of life per
+        cloud DP, from either a heartbeat or a business payload."""
+        activity = dict(self._lwd_hello_last)
+        for connection, last in self._lwd_business_last.items():
+            if last > activity.get(connection, 0.0):
+                activity[connection] = last
+        return activity
+
     def _lwd_silent_probe_clouds(self) -> frozenset[int]:
         """Cloud-grained view of the connection-grained liveness verdict:
         a cloud leaves probe targeting only when EVERY adopted DP route
         of it is silent — the coordination HTTP listener lives with the
-        instance process, so any live DP heartbeat means it still answers.
+        instance process, so any live DP traffic means it still answers.
         A cloud with no adopted route yet is never excluded (its listener
         may already be up while the handshake is pending)."""
         silent = self._lwd_silent_routes
@@ -879,7 +929,7 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
     def _lwd_sweep_liveness(self) -> None:
         """Engine thread, rate-limited to the sweep interval: a silent
         verdict fires the linked data-plane teardown and freezes the gate's
-        snapshot; the next heartbeat releases it."""
+        snapshot; the next heartbeat or business frame releases it."""
         now = time.monotonic()
         if now - self._lwd_last_sweep < _LWD_SWEEP_INTERVAL_S:
             return
@@ -887,7 +937,7 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         with self._lwd_hello_lock:
             gone = sorted(
                 (connection, now - last)
-                for connection, last in self._lwd_hello_last.items()
+                for connection, last in self._lwd_last_activity().items()
                 if connection not in self._lwd_silent
                 and now - last > self._lwd_hello_silent_s
             )
@@ -901,14 +951,14 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             self._lwd_probe_manager.set_silent_clouds(self._lwd_silent_probe_clouds())
         for connection, silent_for in gone:
             lwd_logger.error(
-                "[edge] %s silent %.0fs (no cloud heartbeat)",
+                "[edge] %s silent %.0fs (no heartbeat or cloud traffic)",
                 connection,
                 silent_for,
             )
             notify_cloud_restarted(
                 connection.cloud_id,
                 connection.dp_idx,
-                f"heartbeat silent {silent_for:.0f}s",
+                f"no cloud activity {silent_for:.0f}s",
             )
 
     def _lwd_gate_reason(self, request: Request) -> str | None:
@@ -963,7 +1013,7 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             now = time.monotonic()
             silent = self._lwd_silent_routes | {
                 connection
-                for connection, last in self._lwd_hello_last.items()
+                for connection, last in self._lwd_last_activity().items()
                 if now - last > self._lwd_hello_silent_s
             }
         if not silent:

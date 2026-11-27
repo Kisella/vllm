@@ -38,6 +38,11 @@ def _engine() -> LwdEdgeEngineCore:
     )
     engine._lwd_hello_lock = threading.Lock()
     engine._lwd_hello_last = {CLOUD_0: 1.0}
+    engine._lwd_business_last = {}
+    engine._lwd_hello_boot = {}
+    engine._lwd_silent = set()
+    engine._lwd_silent_routes = frozenset()
+    engine._lwd_runtime_connections = {}
     # Cloud 0 is the accepted startup subset; cloud 1 starts later.
     engine._lwd_clouds = {CLOUD_0: SimpleNamespace(instance_id=0, dp_rank=0)}
     engine._lwd_cloud_params = {}

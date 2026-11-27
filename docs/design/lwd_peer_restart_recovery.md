@@ -89,7 +89,7 @@ flowchart LR
    `register_cloud_restart_hook(hook)` / `notify_cloud_restarted(cloud_id, dp_idx, reason)`
    — the same layering rule as the old branch (the vllm repo never imports
    vllm-ascend; the ascend side registers its teardown at wiring time). Reasons
-   enumerate the detection source (`session fingerprint`, `heartbeat silent`,
+   enumerate the detection source (`session fingerprint`, `no cloud activity`,
    `boot_id changed`).
 5. **Bounded submit wait** (old `VLLM_ASCEND_LWD_UCX_SUBMIT_WAIT_READY_S`, default
    5 s): submit waits for the reconnect window before failing. This is a code
@@ -130,12 +130,17 @@ on **one** receive path.
 
 - The cloud control plane publishes a periodic HELLO (old default 1 s) carrying a
   `boot_id` epoch (random per process launch);
-- The edge keeps per-`(cloud_id, dp_idx)` accounts — `hello_last`, `hello_boot`,
-  a silent set with `frozenset` snapshots (single-writer on the receive thread,
-  main thread reads snapshots — the old branch's concurrency shape);
-- Silent beyond the threshold (code constant `LWD_HELLO_SILENT_S`, 10 s)
-  fires `notify_cloud_restarted(cloud_id, dp_idx,
-  reason="heartbeat silent Ns")` → the registry → **linked teardown** of that
+- The edge keeps per-`(cloud_id, dp_idx)` accounts — `hello_last`, a separate
+  `business_last` (any valid cloud-to-edge request frame), `hello_boot`, a silent
+  set with `frozenset` snapshots (single-writer on the receive thread, main
+  thread reads snapshots — the old branch's concurrency shape). The judge reads
+  `max(hello_last, business_last)`: a heartbeat frame stuck behind a busy
+  outbound FIFO, or a cloud engine thread busy with a long step, no longer
+  makes a cloud that is still answering requests look dead. Boot-id tracking
+  stays heartbeat-only, since business frames carry no epoch;
+- Silent beyond the threshold (code constant `LWD_HELLO_SILENT_S`, 10 s) on
+  BOTH channels fires `notify_cloud_restarted(cloud_id, dp_idx,
+  reason="no cloud activity Ns")` → the registry → **linked teardown** of that
   cloud DP's data-plane links (force reconnect; in-flight ops fail fast), closing
   the "control plane recovered, data plane still zombie" window;
 - `boot_id` change fires the same notification with that reason;
@@ -150,7 +155,7 @@ on **one** receive path.
 - **Availability gate**: the edge engine's admission check rejects new requests
   with `FinishReason.ERROR` while every known route is silent (partial silence
   rejects only requests whose target group is silent). The gate releases on the
-  next heartbeat. Rejection is a client-visible failure, retryable — not a hang.
+  next heartbeat or business frame. Rejection is a client-visible failure, retryable — not a hang.
 
 The heartbeat cadence and the silent threshold are code constants at
 their use sites — `LWD_HELLO_INTERVAL_S` in the cloud engine,

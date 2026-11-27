@@ -2,10 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Liveness layer of the edge engine (peer-restart line, phase 2).
 
-Cloud heartbeats keep per-connection accounts; a silent verdict fires the
-linked teardown through the restart-hook registry and freezes the
-admission gate's snapshot; the next beat releases it. A boot-id change is
-a restart verdict on its own.
+Cloud heartbeats AND cloud business traffic keep per-connection activity
+accounts; a silent verdict fires the linked teardown through the
+restart-hook registry and freezes the admission gate's snapshot; the next
+heartbeat or business frame releases it. A boot-id change is a restart
+verdict on its own.
 """
 
 from __future__ import annotations
@@ -33,6 +34,7 @@ from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_scheduler import (
 from vllm.v1.lwd_control.lwd_comm import lwd_restart_hooks as hooks_module
 from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
     LwdCloudHeartbeat,
+    LwdPrefixReadyNotify,
     lwd_decode_cloud_to_edge,
     lwd_encode_message,
 )
@@ -91,6 +93,7 @@ def _edge_engine(
     engine._lwd_hello_last = {
         connection: time.monotonic() for connection in connections
     }
+    engine._lwd_business_last = {}
     engine._lwd_hello_boot = {}
     engine._lwd_silent = set()
     engine._lwd_silent_routes = frozenset()
@@ -154,7 +157,7 @@ def test_sweep_marks_silent_and_fires_the_teardown(
     assert engine._lwd_silent_routes == frozenset({CONNECTION})
     assert len(notified) == 1
     assert notified[0][0] == 0 and notified[0][1] == 0
-    assert "heartbeat silent" in notified[0][2]
+    assert "no cloud activity" in notified[0][2]
     # The frozen verdict is mirrored into the scheduler: routing keeps
     # the dead route out of its candidates until recovery.
     assert engine.scheduler.silent_pushes[-1] == frozenset({CONNECTION})
@@ -186,8 +189,79 @@ def test_probe_targeting_leaves_only_fully_silent_clouds(
     engine._lwd_last_sweep = 0.0
     engine._lwd_sweep_liveness()
     # Every adopted route of cloud 0 is silent: probe targeting skips it
-    # until a heartbeat returns.
+    # until activity resumes.
     assert engine._lwd_probe_manager.silent_pushes[-1] == frozenset({0})
+
+
+def test_business_traffic_keeps_a_cloud_alive_without_heartbeats(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A heartbeat frame queued behind a busy outbound FIFO must not make a
+    healthy cloud look dead: a recent business frame is independent evidence
+    that the cloud process is still answering requests."""
+    notified: list = []
+    engine = _edge_engine(monkeypatch, [CONNECTION], notified)
+    engine._lwd_hello_last[CONNECTION] = time.monotonic() - 30.0
+    engine._lwd_note_cloud_activity(CONNECTION)
+    engine._lwd_sweep_liveness()
+    assert engine._lwd_silent_routes == frozenset()
+    assert notified == []
+    assert (
+        engine._lwd_gate_reason(SimpleNamespace(request_id="r", client_index=0)) is None
+    )
+
+
+def test_business_traffic_releases_a_silent_verdict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Traffic after a silent verdict clears the gate and the routing
+    exclusion immediately, without waiting for the next heartbeat. It is
+    evidence of life, NOT a restart, so no teardown hook fires."""
+    notified: list = []
+    engine = _edge_engine(monkeypatch, [CONNECTION], notified)
+    engine._lwd_silent = {CONNECTION}
+    engine._lwd_silent_routes = frozenset({CONNECTION})
+    engine._lwd_note_cloud_activity(CONNECTION)
+    assert engine._lwd_silent_routes == frozenset()
+    assert engine.scheduler.silent_pushes[-1] == frozenset()
+    assert engine._lwd_probe_manager.silent_pushes[-1] == frozenset()
+    assert notified == []
+
+
+def test_stale_heartbeat_and_stale_traffic_still_mark_silent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The new evidence has the same 10 s horizon as the heartbeat: a cloud
+    that went quiet on BOTH channels is still torn down. The activity
+    signal widens the evidence, it does not disable liveness."""
+    notified: list = []
+    engine = _edge_engine(monkeypatch, [CONNECTION], notified)
+    old = time.monotonic() - 30.0
+    engine._lwd_hello_last[CONNECTION] = old
+    engine._lwd_business_last[CONNECTION] = old
+    engine._lwd_sweep_liveness()
+    assert engine._lwd_silent_routes == frozenset({CONNECTION})
+    assert len(notified) == 1
+
+
+def test_dispatch_of_a_business_frame_refreshes_activity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The real IO-thread dispatch path must feed the activity ledger —
+    otherwise the second evidence channel would exist but never be used."""
+    notified: list = []
+    engine = _edge_engine(monkeypatch, [CONNECTION], notified)
+    engine._lwd_hello_last[CONNECTION] = time.monotonic() - 30.0
+    engine.input_queue = _RecordingQueue()
+    monkeypatch.setattr(engine, "_lwd_connection_of", lambda peer: CONNECTION)
+    peer = SimpleNamespace(instance_id=0, dp_rank=0)
+    msg = LwdPrefixReadyNotify(request_id="r", hit_tokens=3, nonce=1)
+    assert engine._lwd_dispatch_message(peer, msg) is True
+    assert CONNECTION in engine._lwd_business_last
+    assert engine._lwd_business_last[CONNECTION] > engine._lwd_hello_last[CONNECTION]
+    assert len(engine.input_queue.items) == 1
+    engine._lwd_sweep_liveness()
+    assert engine._lwd_silent_routes == frozenset()
 
 
 def test_sweep_is_rate_limited(monkeypatch: pytest.MonkeyPatch) -> None:

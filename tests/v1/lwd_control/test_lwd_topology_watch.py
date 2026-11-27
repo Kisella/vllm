@@ -411,6 +411,7 @@ def test_a_refused_data_plane_opens_for_service_on_the_next_increment(
     # front, both gate checks below run against it.
     engine._lwd_hello_lock = threading.Lock()
     engine._lwd_hello_last = {LwdConnectionId(1, 1, 0): time.monotonic()}
+    engine._lwd_business_last = {}
     engine._lwd_hello_boot = {}
     engine._lwd_silent = set()
     engine._lwd_silent_routes = frozenset()
@@ -540,6 +541,7 @@ def test_the_gate_rejects_a_control_plane_only_connection(
     engine = _engine(topology_file)
     engine._lwd_hello_lock = threading.Lock()
     engine._lwd_hello_last = {LwdConnectionId(1, 1, 0): time.monotonic()}
+    engine._lwd_business_last = {}
     engine._lwd_hello_boot = {}
     engine._lwd_silent = set()
     engine._lwd_silent_routes = frozenset()
