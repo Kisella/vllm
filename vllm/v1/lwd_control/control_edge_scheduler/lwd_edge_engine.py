@@ -79,7 +79,7 @@ from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
     lwd_encode_structured_outputs,
 )
 from vllm.v1.lwd_control.lwd_exceptions import LwdTransferFailedError
-from vllm.v1.request import Request
+from vllm.v1.request import Request, RequestStatus
 
 # Native batch queue depth: dispatched (embed + unembed) batches not yet
 # reaped. 2 keeps the pipeline aligned; the reference branch's 4 is
@@ -873,7 +873,11 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             len(request_ids),
         )
         if request_ids:
-            self.abort_requests(request_ids)
+            # A cloud already declared silent cannot receive an abort
+            # notify, and a native ABORT finish surfaces as a cancelled /
+            # empty completion rather than a visible failure. Fail those
+            # requests with an explicit ERROR at containment time.
+            self.abort_requests(request_ids, silent_error=True)
         # Empty outputs: the batch produced nothing, but the engine keeps
         # stepping. Matches the step_with_batch_queue return contract.
         return {}, False
@@ -934,8 +938,17 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             return f"cloud unavailable (silent routes {sorted(silent)})"
         return None
 
-    def abort_requests(self, request_ids: list[str]) -> None:
-        """Notify each request's original cloud DP, then finish natively."""
+    def abort_requests(
+        self, request_ids: list[str], *, silent_error: bool = False
+    ) -> None:
+        """Notify each request's original cloud DP, then finish natively.
+
+        With ``silent_error`` (transfer containment), requests routed to a
+        cloud already declared silent finish with an explicit ERROR instead
+        of the native ABORT: a cancelled/empty completion is not a visible
+        failure, and a silent peer cannot receive the notify anyway. Other
+        requests keep the original abort path.
+        """
         control = getattr(self, "_lwd_prefix_control", None)
         if control is not None:
             control.prepare_abort(request_ids)
@@ -943,8 +956,11 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             self._lwd_probe_manager.abort(request_id)
             self._lwd_probe_chains.pop(request_id, None)
         routed_aborts = self.scheduler.lwd_edge_abort(request_ids)
+        silent = self._lwd_heartbeat.frozen_silent_routes()
+        error_by_client: dict[int, list[str]] = {}
+        silent_ids: set[str] = set()
         for dp_idx, request_id in routed_aborts:
-            if dp_idx in self._lwd_heartbeat.frozen_silent_routes():
+            if dp_idx in silent:
                 # A silent cloud cannot receive the notify anyway, and its
                 # own bookkeeping dies with the restart/reset; skipping
                 # keeps the abort (and the containment driving it) from
@@ -954,13 +970,32 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
                     request_id,
                     dp_idx,
                 )
+                if silent_error:
+                    request = self.scheduler.requests.get(request_id)
+                    if request is not None and not request.is_finished():
+                        silent_ids.add(request_id)
+                        error_by_client.setdefault(request.client_index, []).append(
+                            request_id
+                        )
                 continue
             request = self.scheduler.requests.get(request_id)
             self._lwd_send_to_cloud(
                 dp_idx,
                 LwdAbortNotify(request_id, getattr(request, "lwd_prefix_nonce", 0)),
             )
-        super().abort_requests(request_ids)
+        if error_by_client:
+            for client_index, ids in error_by_client.items():
+                self._send_error_outputs_to_client(ids, client_index)
+            # Settle these natively (idempotent) but keep them out of the
+            # ABORT finish path, so the client sees exactly one ERROR.
+            self.scheduler.finish_requests(
+                sorted(silent_ids), RequestStatus.FINISHED_ABORTED
+            )
+            super().abort_requests(
+                [rid for rid in request_ids if rid not in silent_ids]
+            )
+        else:
+            super().abort_requests(request_ids)
 
     def _lwd_notify_request(self, dp_idx: LwdConnectionId, request: Request) -> None:
         """Announce the request to one cloud DP rank, packing the sampling
