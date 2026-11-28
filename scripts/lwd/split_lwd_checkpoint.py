@@ -232,6 +232,7 @@ def load_module_ownership() -> tuple[dict[str, frozenset[str]], bool]:
     Returns:
         (table, live_import) -- ``live_import`` is True when the table was
         imported from the vllm package.
+
     """
     try:
         from vllm.model_executor.models.utils import LWD_MODULE_OWNERSHIP
@@ -304,6 +305,7 @@ def classify_all(
         (keep, drop, uncovered, attribution): ``uncovered`` lists tensors
         matched by no rule at all (the caller must fail fast on them);
         ``attribution`` maps a rule label to its tensor names.
+
     """
     keep: set[str] = set()
     drop: set[str] = set()
@@ -407,6 +409,7 @@ def read_shard_header(path: str) -> tuple[dict[str, TensorInfo], dict | None, in
     Returns:
         (tensor name -> TensorInfo, ``__metadata__`` or None, absolute
         offset where the data area starts)
+
     """
     with open(path, "rb") as handle:
         raw = handle.read(8)
@@ -556,6 +559,7 @@ def classify_safetensors(
 
     Returns:
         (weight shard file names, companion safetensors file names)
+
     """
     files = list_safetensors(src)
     if index_name is not None:
@@ -631,6 +635,7 @@ def plan_shards(
 
     Returns:
         list of (temp shard name, tensor names)
+
     """
     wanted: dict[str, list[str]] = {}
     cur_name = "model-00001-of-XXXXX.safetensors"
