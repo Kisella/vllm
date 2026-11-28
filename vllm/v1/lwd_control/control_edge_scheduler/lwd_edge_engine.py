@@ -21,6 +21,7 @@ from __future__ import annotations
 import threading
 import time
 from collections import deque
+from dataclasses import dataclass
 from typing import Any
 
 from vllm.config.lwd import LwdConnectionId, LwdTopologyIncrement
@@ -108,6 +109,23 @@ _LWD_SWEEP_INTERVAL_S = 1.0
 # of life: a heartbeat frame queued behind a busy outbound FIFO must not
 # make a healthy cloud look dead.
 LWD_HELLO_SILENT_S = 10.0
+
+
+@dataclass(frozen=True)
+class _LwdCloudRestartTick:
+    """`WAKEUP` payload: a cloud DP re-sent its scheduling limits after a
+    process replacement, so the edge's seqno ledger must be reset to match
+    the fresh cloud ledger (engine thread, the single writer).
+
+    The peer-up hook is NOT a replacement signal on the edge: its control
+    plane never unregisters a stopped cloud, so a re-registration is skipped
+    and no peer-up event fires. A repeated ``LwdCloudParamsNotify`` is the
+    observable replacement signal (the cloud only re-sends its limits on a
+    fresh registration or session replacement).
+    """
+
+    connection: LwdConnectionId
+
 
 # A full outbound queue is retried with growing intervals (about 3 s in
 # total) before failing: by then the cloud stopped reading or is gone.
@@ -469,6 +487,15 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             return True
         if isinstance(msg, LwdCloudParamsNotify):
             connection = self._lwd_connection_of(peer)
+            # The cloud re-sends its limits only on a fresh registration or
+            # a session replacement (never for a retried HELLO), so a second
+            # arrival for an already-adopted connection means the cloud
+            # process was replaced. Its prompt-length ledger is empty now;
+            # the edge's seqno stream must restart from zero or the first
+            # RangeNotify of the new stream carries a request id the cloud
+            # never saw and its fail-fast ingest kills the fresh EngineCore.
+            # Reset on the engine thread (single writer), not on this IO thread.
+            replaced = connection in self._lwd_cloud_params
             self._lwd_cloud_params[connection] = msg
             # Elastic partial start: a cloud that started after the edge
             # adopts here — the periodic HELLO kept its handshake alive
@@ -477,6 +504,15 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             self.scheduler.lwd_update_cloud_params(connection, msg)
             self._lwd_cloud_params_received.set()
             self._lwd_heartbeat.note_activity(connection)
+            if replaced:
+                lwd_logger.error(
+                    "[LWD][edge] cloud %s replaced; scheduling limits "
+                    "re-adopted, seqno ledger reset queued",
+                    connection,
+                )
+                self.input_queue.put_nowait(
+                    (EngineCoreRequestType.WAKEUP, _LwdCloudRestartTick(connection))
+                )
             return True
         if isinstance(msg, (LwdPrefixReadyNotify, LwdRefillNotify)):
             self._lwd_heartbeat.note_activity(self._lwd_connection_of(peer))
@@ -710,6 +746,23 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             request, LwdRefillNotify
         ):
             self._lwd_handle_refill(request)
+            return
+        if request_type == EngineCoreRequestType.WAKEUP and isinstance(
+            request, _LwdCloudRestartTick
+        ):
+            # Engine thread (single writer): a replaced cloud re-sent its
+            # limits, so reset this connection's seqno ledger and settle any
+            # request still routed to the dead incarnation.
+            orphaned = self.scheduler.lwd_edge_reset_connection(request.connection)
+            if orphaned:
+                errors: dict[int, list[str]] = {}
+                for request_id in orphaned:
+                    req = self.scheduler.requests.get(request_id)
+                    if req is not None and not req.is_finished():
+                        errors.setdefault(req.client_index, []).append(request_id)
+                for client_index, ids in errors.items():
+                    self._send_error_outputs_to_client(ids, client_index)
+                self.scheduler.finish_requests(orphaned, RequestStatus.FINISHED_ABORTED)
             return
         super()._handle_client_request(request_type, request)
 
